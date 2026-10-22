@@ -1,3 +1,16 @@
+# Environment & Local Secrets
 .env
+*.env
+
+# Local Database Volume Mounts / SQLite Files
+*.db
+*.sqlite3
+pgdata/
+zetaris_data/
+
+# Python Runtime Artifacts
 __pycache__/
 *.pyc
+.pytest_cache/
+.venv/
+env/

@@ -7,11 +7,23 @@ root_dir = Path(__file__).resolve().parent.parent
 if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
 
-from app.agents.extractor import extract_and_log_session
+from app.agents.extractor import extract_and_log_session, get_db_connection
 from app.agents.audit import audit_session_safety
+
+def clear_athlete_history(athlete_id: str):
+    """Wipes historical sessions for clean isolated test runs."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM athlete_sessions WHERE athlete_id = %s;", (athlete_id,))
+            conn.commit()
+    finally:
+        conn.close()
 
 def run_test():
     athlete_id = "athlete_001"
+    clear_athlete_history(athlete_id)  # Clean state before test execution
+    
     day1_date = date(2026, 10, 19) # Monday
     day2_date = date(2026, 10, 20) # Tuesday
 

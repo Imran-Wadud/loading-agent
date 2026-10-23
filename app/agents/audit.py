@@ -1,9 +1,14 @@
 # app/agents/audit.py
+import logging
 from datetime import date, timedelta
 from typing import Dict, Any, List, Optional
 import psycopg2
 from psycopg2.extras import RealDictCursor
+
+# Import connection helper and logger context from extractor
 from app.agents.extractor import get_db_connection
+
+logger = logging.getLogger("loading_agent.audit")
 
 def calculate_recovery_windows(rpe: Optional[float], tissue_type: str) -> int:
     """Calculates hours required for safe recovery based on RPE and tissue type."""
@@ -20,6 +25,7 @@ def audit_session_safety(athlete_id: str, target_date: date, proposed_session_id
     Audits tissue loads logged for proposed_session_id against historic sessions
     within calculated recovery windows (72h Tendon / 48h Muscle).
     """
+    logger.info(f"Auditing safety for session {proposed_session_id} on date {target_date}...")
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -78,6 +84,11 @@ def audit_session_safety(athlete_id: str, target_date: date, proposed_session_id
                 for conflict in prior_conflicts:
                     prior_stress = float(conflict["stress_score"])
                     if prior_stress >= 6.0:
+                        flag_msg = (
+                            f"High {t_type} load on '{bp_name}' (Score {current_stress}) "
+                            f"within {window_hours}h of prior session on {conflict['session_date']} ('{conflict['session_title']}')."
+                        )
+                        logger.warning(f"SAFETY VIOLATION DETECTED: {flag_msg}")
                         safety_flags.append({
                             "tissue_name": bp_name,
                             "tissue_type": t_type,
@@ -85,11 +96,14 @@ def audit_session_safety(athlete_id: str, target_date: date, proposed_session_id
                             "conflict_date": str(conflict["session_date"]),
                             "prior_session": conflict["session_title"],
                             "required_window_hours": window_hours,
-                            "message": f"High {t_type} load on '{bp_name}' (Score {current_stress}) within {window_hours}h of prior high-load session on {conflict['session_date']} ('{conflict['session_title']}')."
+                            "message": flag_msg
                         })
 
+            approved = len(safety_flags) == 0
+            logger.info(f"Audit completed for session {proposed_session_id}. Approved: {approved} (Flags: {len(safety_flags)})")
+
             return {
-                "approved": len(safety_flags) == 0,
+                "approved": approved,
                 "flags_count": len(safety_flags),
                 "safety_flags": safety_flags
             }

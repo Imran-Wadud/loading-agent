@@ -2,6 +2,7 @@
 import json
 import re
 import os
+import logging
 from datetime import date
 from pathlib import Path
 from typing import Dict, Any, List, Optional
@@ -10,8 +11,11 @@ from psycopg2.extras import RealDictCursor
 
 from app.llm import get_llm
 
-# .env is not loaded automatically; os.getenv would otherwise use the
-# hardcoded defaults (password "zetaris") and fail against the Zetaris container.
+# Set up logger for extraction tracking
+logger = logging.getLogger("loading_agent.extractor")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+# Ensure .env variables are available to process os.environ
 _ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 if _ENV_PATH.exists():
     for _line in _ENV_PATH.read_text(encoding="utf-8").splitlines():
@@ -40,7 +44,9 @@ def fetch_canonical_body_parts() -> List[Dict[str, Any]]:
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT body_part_id, name, tissue_type FROM body_parts ORDER BY body_part_id;")
-            return cur.fetchall()
+            parts = cur.fetchall()
+            logger.info(f"Fetched {len(parts)} canonical body parts from database.")
+            return parts
     finally:
         conn.close()
 
@@ -55,6 +61,7 @@ def extract_and_log_session(
     Uses Nemotron to analyze raw timetable text, match canonical body parts,
     and persist session + tissue loads into Zetaris PostgreSQL.
     """
+    logger.info(f"Starting extraction for Athlete '{athlete_id}' on {session_date} (RPE: {session_rpe})")
     body_parts = fetch_canonical_body_parts()
     body_parts_text = "\n".join([f"- ID {bp['body_part_id']}: {bp['name']} ({bp['tissue_type']})" for bp in body_parts])
 
@@ -78,19 +85,25 @@ def extract_and_log_session(
     user_prompt = f"Athlete Input Text:\n{raw_text}{rpe_context}"
 
     llm = get_llm()
+    logger.info("Invoking Nemotron LLM for anatomical extraction...")
+    
     response = llm.invoke([
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt}
     ])
 
     raw_content = response.content.strip()
+    logger.info("Received LLM response successfully.")
+
     json_match = re.search(r"\{.*\}", raw_content, re.DOTALL)
     if not json_match:
+        logger.error("Failed to parse valid JSON from LLM response!")
         raise ValueError("Failed to extract valid JSON from Nemotron output.")
 
     parsed = json.loads(json_match.group(0))
     session_title = parsed.get("session_title", "Logged Training Session")
     loads = parsed.get("loads", [])
+    logger.info(f"Extracted session title: '{session_title}' with {len(loads)} tissue loads.")
 
     # Persist into PostgreSQL / Zetaris
     conn = get_db_connection()
@@ -106,6 +119,7 @@ def extract_and_log_session(
                 (athlete_id, session_date, session_title, raw_text, session_rpe)
             )
             session_id = cur.fetchone()["session_id"]
+            logger.info(f"Created athlete_sessions record UUID: {session_id}")
 
             # 2. Insert into tissue_loads_logged
             inserted_loads = []
@@ -122,6 +136,7 @@ def extract_and_log_session(
                 inserted_loads.append(item)
 
             conn.commit()
+            logger.info(f"Successfully logged {len(inserted_loads)} tissue loads to DB.")
 
             return {
                 "session_id": str(session_id),
@@ -133,6 +148,7 @@ def extract_and_log_session(
             }
     except Exception as e:
         conn.rollback()
+        logger.error(f"Database error during session persistence: {e}")
         raise e
     finally:
         conn.close()

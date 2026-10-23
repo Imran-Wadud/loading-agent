@@ -118,19 +118,17 @@ class WorkoutAuditReport(BaseModel):
 # 3. LANGGRAPH AGENT STATE SCHEMA
 # ==========================================
 
+# app/schemas.py
+
 class AgentState(BaseModel):
-    """
-    Shared state object passed through the LangGraph collaboration loop.
-    """
     athlete_id: str = "athlete_001"
     target_date: date
     user_prompt: str = ""
     
-    # Routine Pipeline
     proposed_workout: Optional[DailyWorkout] = None
     audit_report: Optional[WorkoutAuditReport] = None
+    dynamic_catalog: Dict[str, Exercise] = Field(default_factory=dict)  # Add this line
     
-    # Execution Tracking & Human-In-The-Loop
     iteration_count: int = 0
     max_iterations: int = 3
     human_approved: Optional[bool] = None

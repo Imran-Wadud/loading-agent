@@ -1,9 +1,17 @@
 # app/ui.py
 import os
 import sys
+import logging
 from pathlib import Path
 from datetime import date, timedelta
 import streamlit as st
+
+# Configure global root logger for stdout terminal output
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+    force=True
+)
 
 # Ensure root directory is in sys.path
 root_dir = Path(__file__).resolve().parent.parent
@@ -194,4 +202,4 @@ with tab_profile:
     st.text_input("Athlete ID", value="athlete_001")
     st.number_input("Baseline Sleep (Hours)", value=8.0)
     st.multiselect("Active Tendon Vulnerabilities", ["Patellar Tendon", "Achilles Tendon", "Hamstring Tendon"], default=["Patellar Tendon"])
-    st.button("Save Profile Settings")
+    st.button("Save Profile Settings", use_container_width=False)

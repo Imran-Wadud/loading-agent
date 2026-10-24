@@ -104,6 +104,29 @@ class ZetarisDBAdapter:
     def get_canonical_body_parts(self) -> List[Dict[str, Any]]:
         return fetch_canonical_body_parts()
 
+    def fetch_historical_daily_loads(self, athlete_id: str, target_date: date, days: int = 28) -> Dict[date, float]:
+        """
+        Fetches total daily accumulated tissue stress score for an athlete over the past N days.
+        """
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                start_date = target_date - timedelta(days=days - 1)
+                cur.execute(
+                    """
+                    SELECT s.session_date, COALESCE(SUM(tl.stress_score), 0.0) as daily_load
+                    FROM athlete_sessions s
+                    JOIN tissue_loads_logged tl ON s.session_id = tl.session_id
+                    WHERE s.athlete_id = %s AND s.session_date BETWEEN %s AND %s
+                    GROUP BY s.session_date;
+                    """,
+                    (athlete_id, start_date, target_date)
+                )
+                rows = cur.fetchall()
+                return {row["session_date"]: float(row["daily_load"]) for row in rows}
+        finally:
+            conn.close()
+
     def get_active_recovery_window(self, athlete_id: str, session_date: date) -> List[Dict[str, Any]]:
         """Queries historical sessions logged within the 3-day (72h) lookback window."""
         conn = get_db_connection()

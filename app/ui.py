@@ -97,7 +97,7 @@ with tab_evaluator:
                 help="Enter plaintext description of exercises, sets, reps, or sports activity."
             )
             
-            submit_btn = st.form_submit_button("🚀 Run Evaluation Pipeline", use_container_width=True)
+            submit_btn = st.form_submit_button("🚀 Run Evaluation Pipeline", width='stretch')
 
     with col_right:
         st.subheader("🤖 Real-Time Node Breakdown")
@@ -134,7 +134,7 @@ with tab_evaluator:
                                     "Pass Votes": f"{item.get('consensus_votes', 3)} / 3"
                                 }
                                 for item in loads
-                            ], use_container_width=True, hide_index=True)
+                            ], width='stretch', hide_index=True)
                             
                     elif node_name == "audit":
                         status_box.write("🌐 **Meterless World Model Engine:** State Simulation & Biomechanical Audit Complete")
@@ -190,7 +190,7 @@ with tab_matrix:
                 "Recovery Window": "72h Remodeling" if item["tissue_type"] == "TENDON" else "48h Synthesis"
             }
             for item in active_loads
-        ], use_container_width=True, hide_index=True)
+        ], width='stretch', hide_index=True)
     else:
         st.info("No active tissue load history logged in the past 72 hours.")
 
@@ -202,4 +202,4 @@ with tab_profile:
     st.text_input("Athlete ID", value="athlete_001")
     st.number_input("Baseline Sleep (Hours)", value=8.0)
     st.multiselect("Active Tendon Vulnerabilities", ["Patellar Tendon", "Achilles Tendon", "Hamstring Tendon"], default=["Patellar Tendon"])
-    st.button("Save Profile Settings", use_container_width=False)
+    st.button("Save Profile Settings", width='content')

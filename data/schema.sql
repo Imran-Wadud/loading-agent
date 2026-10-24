@@ -43,46 +43,5 @@ CREATE TABLE tissue_loads_logged (
     CONSTRAINT unique_session_body_part UNIQUE (session_id, body_part_id)
 );
 
--- Seed Default Athlete Profile
-INSERT INTO athletes (athlete_id, name, experience_level)
-VALUES ('athlete_001', 'Default Athlete', 'INTERMEDIATE');
-
--- Seed Standard Muscle & Tendon Dictionary
-INSERT INTO body_parts (name, tissue_type) VALUES
-    -- TENDONS & CONNECTIVE TISSUE
-    ('Patellar Tendon', 'TENDON'),
-    ('Achilles Tendon', 'TENDON'),
-    ('Rotator Cuff Tendons', 'TENDON'),
-    ('Distal Biceps Tendon', 'TENDON'),
-    ('Triceps Brachii Tendon', 'TENDON'),
-    ('Hamstring Tendons', 'TENDON'),
-    ('Plantar Fascia', 'TENDON'),
-    ('Iliotibial (IT) Band', 'TENDON'),
-    ('Common Extensor Tendon (Lateral Epicondyle)', 'TENDON'),
-    ('Common Flexor Tendon (Medial Epicondyle)', 'TENDON'),
-
-    -- LOWER EXTREMITY MUSCLES
-    ('Quadriceps Femoris', 'MUSCLE'),
-    ('Hamstrings (Biceps Femoris / Semitendinosus / Semimembranosus)', 'MUSCLE'),
-    ('Gastrocnemius & Soleus', 'MUSCLE'),
-    ('Tibialis Anterior', 'MUSCLE'),
-    ('Gluteus Maximus', 'MUSCLE'),
-    ('Gluteus Medius & Minimus', 'MUSCLE'),
-    ('Hip Adductors (Adductor Longus / Magnus / Brevis)', 'MUSCLE'),
-    ('Iliopsoas (Hip Flexors)', 'MUSCLE'),
-
-    -- UPPER EXTREMITY & SHOULDER MUSCLES
-    ('Pectoralis Major & Minor', 'MUSCLE'),
-    ('Latissimus Dorsi', 'MUSCLE'),
-    ('Trapezius (Upper / Middle / Lower)', 'MUSCLE'),
-    ('Rhomboids', 'MUSCLE'),
-    ('Deltoids (Anterior / Lateral / Posterior)', 'MUSCLE'),
-    ('Biceps Brachii & Brachialis', 'MUSCLE'),
-    ('Triceps Brachii', 'MUSCLE'),
-    ('Wrist Flexors & Extensors (Forearms)', 'MUSCLE'),
-
-    -- CORE & AXIAL MUSCLES
-    ('Rectus Abdominis', 'MUSCLE'),
-    ('Obliques (Internal / External)', 'MUSCLE'),
-    ('Erector Spinae', 'MUSCLE'),
-    ('Quadratus Lumborum', 'MUSCLE');
+CREATE INDEX IF NOT EXISTS idx_sessions_athlete_date ON athlete_sessions(athlete_id, session_date);
+CREATE INDEX IF NOT EXISTS idx_loads_session ON tissue_loads_logged(session_id);

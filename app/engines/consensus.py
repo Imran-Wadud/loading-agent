@@ -1,16 +1,14 @@
 # app/engines/consensus.py
 import json
 import re
-import os
 import logging
 from datetime import date
 from typing import Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import statistics
 
-# Make sure this points to adapters!
 from app.adapters.meterless import get_meterless_llm
-from app.adapters.zetaris import fetch_canonical_body_parts, get_db_connection
+from app.adapters.zetaris import fetch_canonical_body_parts
 
 logger = logging.getLogger("loading_agent.consensus")
 
@@ -21,8 +19,8 @@ def extract_single_pass(
     session_rpe: Optional[float],
     body_parts: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
-    """Executes a single extraction pass using the Meterless Nemotron LLM."""
-    logger.info(f"[Pass {pass_num}] Initiating Nemotron extraction...")
+    """Executes a single extraction pass using the configured LLM adapter."""
+    logger.info(f"[Pass {pass_num}] Initiating extraction...")
     body_parts_text = "\n".join([f"- ID {bp['body_part_id']}: {bp['name']} ({bp['tissue_type']})" for bp in body_parts])
 
     system_prompt = (
@@ -37,7 +35,7 @@ def extract_single_pass(
         '  "loads": [\n'
         '    {"body_part_id": 1, "stress_score": 8.5, "volume_mins": 60},\n'
         '    {"body_part_id": 11, "stress_score": 7.0, "volume_mins": 45}\n'
-        '  ]\n'
+        "  ]\n"
         "}\n"
     )
 
@@ -53,6 +51,8 @@ def extract_single_pass(
         ])
 
         raw_content = response.content.strip()
+        
+        # Robust Regex Extraction (handles raw JSON, ```json blocks, and text preambles)
         json_match = re.search(r"\{.*\}", raw_content, re.DOTALL)
         if not json_match:
             logger.error(f"[Pass {pass_num}] Failed to parse valid JSON from LLM output: {raw_content[:100]}")
@@ -65,6 +65,7 @@ def extract_single_pass(
     except Exception as e:
         logger.error(f"[Pass {pass_num}] LLM Invoke Exception: {e}", exc_info=True)
         return {"session_title": "Exception", "loads": []}
+
 
 def run_meterless_consensus(
     athlete_id: str,

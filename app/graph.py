@@ -121,38 +121,51 @@ def audit_node(state: WorkloadState) -> Dict[str, Any]:
 
 def remediate_node(state: WorkloadState) -> Dict[str, Any]:
     """Node 3: Proposes alternative workout plan resolving audit flags."""
-    attempts = state.get("remediation_attempts", 0) + 1
-    logger.info(f"--- [LangGraph] Entering Remediation Generator Node (Attempt {attempts}) ---")
-    
-    flags_summary = "\n".join([f"- {f['message']}" for f in state.get("audit_flags", [])])
-    
-    log_agent_step(
-        agent_name="RemediationAgent",
-        action="generating_workout_fix",
-        details={
-            "attempt": attempts,
-            "flagged_issues": len(state.get("audit_flags", []))
-        }
-    )
-    
-    system_prompt = (
-        "You are an expert Athletic Performance & Rehabilitation Coach.\n"
-        "The proposed workout has safety/overuse violations based on active tissue recovery windows:\n"
-        f"{flags_summary}\n\n"
-        "Propose a modified workout for today that COMPLETELY AVOIDS overusing these compromised body parts.\n"
-        "Shift focus to unaffected muscle groups or active recovery exercises.\n"
-        "Provide a clear, structured alternative workout description."
-    )
-    
+   
+    athlete_id = state["athlete_id"]
+    session_date = state["session_date"]
+    audit_flags = state.get("audit_flags", [])
+    temporal_tier = state.get("temporal_tier", "FUTURE_OR_TODAY")
+    attempt = state.get("remediation_attempts", 0) + 1
+
     llm = get_meterless_llm()
+
+    if temporal_tier == "RECENT_PAST":
+        system_prompt = (
+            "You are an expert Sports Physical Therapist & Recovery Specialist.\n"
+            "This workout ALREADY OCCURRED in the past 1 to 3 days. DO NOT suggest modifying or replacing the past workout.\n"
+            "Instead, generate a Targeted Recovery Protocol & Future Shielding Plan containing:\n"
+            "1. Localized Therapy Protocols (e.g., isometric holds for tendon relief, contrast showers, active mobility work).\n"
+            "2. Nutritional & Sleep Targets (protein pacing, anti-inflammatory guidelines).\n"
+            "3. Next-Session Shielding Warnings (specific guidance on what exercises/loads to reduce in the upcoming 48-72 hours).\n"
+            "Provide clear, practical, bulleted recommendations."
+        )
+    else:
+        system_prompt = (
+            "You are an expert Strength & Conditioning Biomechanics Agent.\n"
+            "The proposed future/today workout caused biomechanical tissue recovery or ACWR safety violations.\n"
+            "Generate an alternative, modified training session that:\n"
+            "1. Reduces mechanical stress on the flagged body parts.\n"
+            "2. Replaces high-impact movements with safer alternatives.\n"
+            "3. Keeps the overall training stimulus effective while lowering RPE/volume.\n"
+            "Format the output clearly as a structured workout session."
+        )
+
+    user_prompt = (
+        f"Athlete: {athlete_id}\n"
+        f"Session Date: {session_date}\n"
+        f"Temporal Tier: {temporal_tier}\n"
+        f"Flagged Safety Violations:\n" + "\n".join([f"- {v.get('message', v)}" for v in audit_flags])
+    )
+
     response = llm.invoke([
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Original Input: {state['raw_input']}"}
+        {"role": "user", "content": user_prompt}
     ])
-    
+
     return {
-        "remediation_suggestion": response.content.strip(),
-        "remediation_attempts": attempts
+        "remediation_suggestion": response.content,
+        "remediation_attempts": attempt
     }
 
 

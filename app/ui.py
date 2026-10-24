@@ -11,7 +11,7 @@ if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
 
 from app.graph import workload_graph
-from app.agents.extractor import get_db_connection, fetch_canonical_body_parts
+from app.adapters.zetaris import get_db_connection, fetch_canonical_body_parts
 
 # Page Config
 st.set_page_config(
@@ -59,7 +59,7 @@ def get_active_tissue_status(athlete_id: str, target_date: date):
 
 # Layout Header
 st.markdown('<div class="main-header">⚡ Athletic Workload & Recovery Engine</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">LangGraph Non-Linear Agent | 72h Tendon & 48h Muscle Remodeling</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">LangGraph Non-Linear Agent | Meterless Consensus & World Model Simulation</div>', unsafe_allow_html=True)
 
 # Top Navigation Tabs
 tab_evaluator, tab_matrix, tab_profile = st.tabs([
@@ -106,10 +106,6 @@ with tab_evaluator:
             # Live Status Container
             status_box = st.status("Executing LangGraph Nodes...", expanded=True)
             
-            # Streaming node events from workload_graph
-            # app/ui.py
-
-            # Replace the loop inside 'if submit_btn:' with this guarded version:
             final_state = {}
             for event in workload_graph.stream(initial_state):
                 for node_name, node_output in event.items():
@@ -119,7 +115,7 @@ with tab_evaluator:
                         continue
                         
                     if node_name == "consensus":
-                        status_box.write("✅ **Consensus Node Complete:** 3-Pass Parallel Extracted Tissue Loads")
+                        status_box.write("✅ **Meterless Consensus Engine Complete:** 3-Pass Parallel Extraction & Voting")
                         loads = node_output.get("consensus_loads", [])
                         if loads:
                             st.write(f"**Extracted Session Title:** `{node_output.get('session_title')}`")
@@ -133,14 +129,14 @@ with tab_evaluator:
                             ], use_container_width=True, hide_index=True)
                             
                     elif node_name == "audit":
-                        status_box.write("✅ **Biomechanical Audit Node Complete:** Queried Database")
+                        status_box.write("🌐 **Meterless World Model Engine:** State Simulation & Biomechanical Audit Complete")
                         flags = node_output.get("audit_flags", [])
                         if flags:
-                            st.error(f"⚠️ **{len(flags)} Safety Violations Detected!**")
+                            st.error(f"⚠️ **{len(flags)} Safety Violations Detected in World Model Simulation!**")
                             for flag in flags:
                                 st.caption(f"• {flag['message']}")
                         else:
-                            st.success("✅ **0 Safety Violations Detected! Session Approved.**")
+                            st.success("✅ **0 Safety Violations Detected! Simulation Approved.**")
                             
                     elif node_name == "remediate":
                         status_box.write("🔄 **Remediation Node Triggered:** Generating Alternative Session Plan...")

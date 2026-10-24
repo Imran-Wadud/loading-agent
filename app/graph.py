@@ -1,112 +1,155 @@
 # app/graph.py
+import json
+import re
+import os
 import logging
 from typing import TypedDict, List, Dict, Any, Optional
-from datetime import date, timedelta
+from datetime import date
 from langgraph.graph import StateGraph, END
 
-from app.agents.consensus import extract_with_consensus
-from app.agents.audit import audit_session_safety, calculate_recovery_windows
-from app.agents.extractor import fetch_canonical_body_parts, get_db_connection
-from app.llm import get_llm
+# Adapters & Engines
+from app.adapters.meterless import get_meterless_llm
+from app.adapters.zetaris import ZetarisDBAdapter, get_db_connection
+from app.engines.consensus import run_meterless_consensus
+from app.engines.world_model import WorldModelEngine
+
+# Telemetry Tracing
+from app.tracing import log_agent_step, log_audit_verdict
 
 logger = logging.getLogger("loading_agent.graph")
 
-# ==========================================
-# 1. State Schema Definition
-# ==========================================
+# =====================================================================
+# 1. State Definition
+# =====================================================================
 class WorkloadState(TypedDict):
-    # Input Context
     athlete_id: str
     session_date: date
     raw_input: str
     session_rpe: Optional[float]
     
-    # Consensus Stage
+    # Consensus Outputs
     session_title: Optional[str]
-    raw_consensus_passes: Optional[int]
-    consensus_loads: List[Dict[str, Any]]
+    consensus_loads: Optional[List[Dict[str, Any]]]
     
-    # Audit Stage
-    session_id: Optional[str]
-    is_approved: bool
-    audit_flags: List[Dict[str, Any]]
+    # World Model / Audit Outputs
+    audit_approved: Optional[bool]
+    audit_flags: Optional[List[Dict[str, Any]]]
+    world_model_state: Optional[Dict[str, Any]]
     
-    # Non-Linear Remediation Loop
+    # Remediation Loop
     remediation_suggestion: Optional[str]
-    evaluator_approved: bool
-    evaluator_feedback: Optional[str]
     remediation_attempts: int
+    evaluator_approved: Optional[bool]
     
     # Final Outcome
-    final_status: str
+    final_status: Optional[str]
 
 
-# ==========================================
-# 2. Graph Node Implementations
-# ==========================================
+# =====================================================================
+# 2. Graph Node Functions with Tracing Telemetry
+# =====================================================================
 
 def consensus_node(state: WorkloadState) -> Dict[str, Any]:
-    """Node 1: Executes Meterless Consensus Engine across N parallel passes."""
+    """Node 1: Executes 3-Pass Meterless Consensus Engine."""
     logger.info("--- [LangGraph] Entering Consensus Node ---")
-    res = extract_with_consensus(
+    
+    res = run_meterless_consensus(
         athlete_id=state["athlete_id"],
         session_date=state["session_date"],
         raw_text=state["raw_input"],
-        session_rpe=state.get("session_rpe"),
-        num_passes=3
+        session_rpe=state.get("session_rpe")
     )
+    
+    # Trace step event
+    log_agent_step(
+        agent_name="ConsensusEngine",
+        action="3_pass_extraction_completed",
+        details={
+            "athlete_id": state["athlete_id"],
+            "session_title": res["session_title"],
+            "extracted_tissues_count": len(res["consensus_loads"])
+        }
+    )
+    
     return {
-        "session_id": res["session_id"],
         "session_title": res["session_title"],
-        "raw_consensus_passes": res["consensus_passes"],
         "consensus_loads": res["consensus_loads"]
     }
 
 
 def audit_node(state: WorkloadState) -> Dict[str, Any]:
-    """Node 2: Evaluates 72h Tendon / 48h Muscle recovery windows against DB logs."""
-    logger.info("--- [LangGraph] Entering Biomechanical Audit Node ---")
-    audit = audit_session_safety(
+    """Node 2: World Model Engine Simulation & Biomechanical Audit."""
+    logger.info("--- [LangGraph] Entering World Model Simulation / Audit Node ---")
+    
+    db_adapter = ZetarisDBAdapter()
+    world_model = WorldModelEngine(db_adapter)
+    
+    simulation_result = world_model.simulate_state_delta(
         athlete_id=state["athlete_id"],
-        target_date=state["session_date"],
-        proposed_session_id=state["session_id"]
+        session_date=state["session_date"],
+        extracted_loads=state["consensus_loads"],
+        session_rpe=state.get("session_rpe", 8.0)
     )
     
-    status = "APPROVED" if audit["approved"] else "NEEDS_REMEDIATION"
+    approved = simulation_result["simulation_approved"]
+    violations = simulation_result["violations"]
+    
+    # Log structured step & audit verdict telemetry
+    log_agent_step(
+        agent_name="WorldModelEngine",
+        action="state_delta_simulation",
+        details={
+            "athlete_id": state["athlete_id"],
+            "simulation_approved": approved,
+            "violations_count": len(violations)
+        }
+    )
+    
+    # Log audit summary metric (defaulting ACWR baseline to 1.0 if not computed)
+    log_audit_verdict(
+        approved=approved,
+        flags_count=len(violations),
+        acwr=simulation_result.get("acwr", 1.0)
+    )
+    
     return {
-        "is_approved": audit["approved"],
-        "audit_flags": audit["safety_flags"],
-        "final_status": status
+        "audit_approved": approved,
+        "audit_flags": violations,
+        "world_model_state": simulation_result["state_delta_summary"]
     }
 
 
-def remediation_node(state: WorkloadState) -> Dict[str, Any]:
-    """Node 3: Generates an alternative session plan addressing active audit flags."""
+def remediate_node(state: WorkloadState) -> Dict[str, Any]:
+    """Node 3: Proposes alternative workout plan resolving audit flags."""
     attempts = state.get("remediation_attempts", 0) + 1
     logger.info(f"--- [LangGraph] Entering Remediation Generator Node (Attempt {attempts}) ---")
     
-    flags_text = "\n".join([f"- {f['message']}" for f in state["audit_flags"]])
-    feedback_context = f"\nPrevious Evaluator Feedback:\n{state['evaluator_feedback']}" if state.get("evaluator_feedback") else ""
-
+    flags_summary = "\n".join([f"- {f['message']}" for f in state.get("audit_flags", [])])
+    
+    log_agent_step(
+        agent_name="RemediationAgent",
+        action="generating_workout_fix",
+        details={
+            "attempt": attempts,
+            "flagged_issues": len(state.get("audit_flags", []))
+        }
+    )
+    
     system_prompt = (
-        "You are an elite S&C Biomechanics Specialist.\n"
-        "The proposed training session caused recovery safety violations.\n"
-        "Your goal is to suggest an ALTERNATIVE training session or modification "
-        "that avoids overloading the flagged tissues while preserving training stimulus.\n"
+        "You are an expert Athletic Performance & Rehabilitation Coach.\n"
+        "The proposed workout has safety/overuse violations based on active tissue recovery windows:\n"
+        f"{flags_summary}\n\n"
+        "Propose a modified workout for today that COMPLETELY AVOIDS overusing these compromised body parts.\n"
+        "Shift focus to unaffected muscle groups or active recovery exercises.\n"
+        "Provide a clear, structured alternative workout description."
     )
-    user_prompt = (
-        f"Original Workout:\n{state['raw_input']}\n\n"
-        f"Safety Violations Detected:\n{flags_text}\n"
-        f"{feedback_context}\n"
-        "Provide a clear, modified workout prescription and briefly explain why it is safe."
-    )
-
-    llm = get_llm()
+    
+    llm = get_meterless_llm()
     response = llm.invoke([
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
+        {"role": "user", "content": f"Original Input: {state['raw_input']}"}
     ])
-
+    
     return {
         "remediation_suggestion": response.content.strip(),
         "remediation_attempts": attempts
@@ -114,136 +157,146 @@ def remediation_node(state: WorkloadState) -> Dict[str, Any]:
 
 
 def evaluator_node(state: WorkloadState) -> Dict[str, Any]:
-    """Node 4: Evaluator Node re-checks proposed candidate fix against recovery rules."""
+    """Node 4: Evaluator Node validating candidate remediation plan."""
     logger.info("--- [LangGraph] Entering Evaluator Node ---")
     
-    # Ask Nemotron to parse the candidate fix into candidate tissue loads
-    body_parts = fetch_canonical_body_parts()
+    db_adapter = ZetarisDBAdapter()
+    body_parts = db_adapter.get_canonical_body_parts()
     body_parts_text = "\n".join([f"- ID {bp['body_part_id']}: {bp['name']} ({bp['tissue_type']})" for bp in body_parts])
     
     system_prompt = (
-        "You are an S&C Evaluator. Parse the proposed modified workout text and map it "
-        f"ONLY to these body parts:\n{body_parts_text}\n"
-        "Return raw JSON format: {\"loads\": [{\"body_part_id\": 1, \"stress_score\": 7.0}]}"
+        "You are a Biomechanical Compliance Inspector.\n"
+        "Analyze the proposed Candidate Workout fix below.\n"
+        "Extract the engaged body part IDs and estimated stress scores (1.0 - 10.0).\n"
+        "Map ONLY to these canonical body parts:\n"
+        f"{body_parts_text}\n\n"
+        "Return ONLY a raw JSON object with key 'loads': [{'body_part_id': int, 'stress_score': float}]"
     )
     
-    llm = get_llm()
+    llm = get_meterless_llm()
     eval_resp = llm.invoke([
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": f"Candidate Workout:\n{state['remediation_suggestion']}"}
     ])
     
-    import json, re
-    json_match = re.search(r"\{.*\}", eval_resp.content.strip(), re.DOTALL)
-    if not json_match:
-        return {
-            "evaluator_approved": False,
-            "evaluator_feedback": "Could not verify candidate workout tissue safety structure."
-        }
-    
-    candidate_loads = json.loads(json_match.group(0)).get("loads", [])
-    
-    # Check candidate loads against the active audit flags
-    flagged_ids = set()
-    conn = get_db_connection()
     try:
-        with conn.cursor() as cur:
-            for flag in state["audit_flags"]:
-                cur.execute("SELECT body_part_id FROM body_parts WHERE name = %s;", (flag["tissue_name"],))
-                res = cur.fetchone()
-                if res:
-                    flagged_ids.add(res["body_part_id"])
-    finally:
-        conn.close()
-
-    new_conflicts = [item for item in candidate_loads if item.get("body_part_id") in flagged_ids and item.get("stress_score", 0) >= 6.0]
-
-    if not new_conflicts:
-        logger.info("Evaluator Node: Candidate fix APPROVED!")
-        return {
-            "evaluator_approved": True,
-            "evaluator_feedback": None,
-            "final_status": "REMEDIATED_APPROVED"
-        }
-    else:
-        logger.warning(f"Evaluator Node: Candidate fix REJECTED ({len(new_conflicts)} lingering conflicts).")
-        return {
-            "evaluator_approved": False,
-            "evaluator_feedback": f"Candidate still loads flagged tissue IDs {flagged_ids} with high score >= 6.0.",
-            "final_status": "REMEDIATION_REJECTED"
-        }
+        json_match = re.search(r"\{.*\}", eval_resp.content.strip(), re.DOTALL)
+        candidate_loads = json.loads(json_match.group(0)).get("loads", []) if json_match else []
+        
+        world_model = WorldModelEngine(db_adapter)
+        eval_simulation = world_model.simulate_state_delta(
+            athlete_id=state["athlete_id"],
+            session_date=state["session_date"],
+            extracted_loads=candidate_loads,
+            session_rpe=state.get("session_rpe", 8.0)
+        )
+        
+        is_approved = eval_simulation["simulation_approved"]
+        
+        log_agent_step(
+            agent_name="EvaluatorAgent",
+            action="remediation_validation",
+            details={
+                "candidate_approved": is_approved,
+                "remediation_attempt": state.get("remediation_attempts", 1)
+            }
+        )
+        log_audit_verdict(
+            approved=is_approved,
+            flags_count=len(eval_simulation["violations"]),
+            acwr=eval_simulation.get("acwr", 1.0)
+        )
+        
+        return {"evaluator_approved": is_approved}
+        
+    except Exception as e:
+        logger.error(f"Evaluator parsing error: {e}")
+        return {"evaluator_approved": False}
 
 
 def commit_node(state: WorkloadState) -> Dict[str, Any]:
-    """Node 5: Finalizing execution state."""
-    logger.info(f"--- [LangGraph] Final Commit Node. Outcome: {state['final_status']} ---")
-    return {}
-
-
-# ==========================================
-# 3. Dynamic Conditional Routing Edges
-# ==========================================
-
-def route_after_audit(state: WorkloadState) -> str:
-    """Decides if session goes straight to commit or triggers remediation."""
-    if state["is_approved"]:
-        return "commit"
-    return "remediate"
-
-
-def route_after_evaluation(state: WorkloadState) -> str:
-    """Routes back to remediation loop if evaluation failed and attempts < 3."""
-    if state["evaluator_approved"]:
-        return "commit"
+    """Node 5: Commits approved state to PostgreSQL / Zetaris."""
+    outcome = "APPROVED" if state.get("audit_approved") else "REMEDIATED_APPROVED"
+    logger.info(f"--- [LangGraph] Final Commit Node. Outcome: {outcome} ---")
     
-    if state["remediation_attempts"] >= 3:
-        logger.warning("Max remediation attempts reached (3). Escalating to Coach Review.")
+    log_agent_step(
+        agent_name="CommitAdapter",
+        action="database_persistence",
+        details={
+            "athlete_id": state["athlete_id"],
+            "session_title": state.get("session_title"),
+            "final_status": outcome
+        }
+    )
+    
+    db_adapter = ZetarisDBAdapter()
+    db_adapter.save_approved_session(
+        athlete_id=state["athlete_id"],
+        session_date=state["session_date"],
+        session_title=state.get("session_title", "Logged Session"),
+        raw_text=state["raw_input"],
+        session_rpe=state.get("session_rpe"),
+        consensus_loads=state.get("consensus_loads", [])
+    )
+    
+    return {"final_status": outcome}
+
+
+# =====================================================================
+# 3. Conditional Routing Rules
+# =====================================================================
+
+def route_audit(state: WorkloadState) -> str:
+    if state.get("audit_approved"):
         return "commit"
-        
     return "remediate"
 
 
-# ==========================================
-# 4. Constructing the LangGraph Workflow
-# ==========================================
+def route_remediation(state: WorkloadState) -> str:
+    if state.get("evaluator_approved"):
+        return "commit"
+    if state.get("remediation_attempts", 0) >= 3:
+        logger.warning("Max remediation retry attempts reached (3). Route to END.")
+        return "max_retries_reached"
+    return "remediate"
+
+
+# =====================================================================
+# 4. Building the Graph
+# =====================================================================
 
 builder = StateGraph(WorkloadState)
 
-# Add Nodes
 builder.add_node("consensus", consensus_node)
 builder.add_node("audit", audit_node)
-builder.add_node("remediate", remediation_node)
+builder.add_node("remediate", remediate_node)
 builder.add_node("evaluator", evaluator_node)
 builder.add_node("commit", commit_node)
 
-# Add Direct Edges
 builder.set_entry_point("consensus")
 builder.add_edge("consensus", "audit")
 
-# Add Conditional Edge 1 (Audit -> Commit or Remediate)
 builder.add_conditional_edges(
     "audit",
-    route_after_audit,
+    route_audit,
     {
         "commit": "commit",
         "remediate": "remediate"
     }
 )
 
-# Add Direct Edge (Remediate -> Evaluator)
 builder.add_edge("remediate", "evaluator")
 
-# Add Conditional Edge 2 (Evaluator Loop -> Remediate or Commit)
 builder.add_conditional_edges(
     "evaluator",
-    route_after_evaluation,
+    route_remediation,
     {
-        "remediate": "remediate",  # Loop back!
-        "commit": "commit"
+        "commit": "commit",
+        "remediate": "remediate",
+        "max_retries_reached": END
     }
 )
 
 builder.add_edge("commit", END)
 
-# Compile Graph
 workload_graph = builder.compile()

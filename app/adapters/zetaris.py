@@ -137,6 +137,45 @@ class ZetarisDBAdapter:
         finally:
             conn.close()
 
+    def load_usl_sessions(self, athlete_id: str) -> List[Dict[str, Any]]:
+        """Loads athlete sessions from PostgreSQL backing the USL table."""
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT session_id, athlete_id, session_date, session_title, 
+                           session_rpe, raw_input, status, acwr, remediation_suggestion
+                    FROM athlete_sessions
+                    WHERE athlete_id = %s
+                    ORDER BY session_date ASC;
+                    """,
+                    (athlete_id,)
+                )
+                return cur.fetchall()
+        finally:
+            conn.close()
+
+    def load_usl_tissue_loads(self, athlete_id: str) -> List[Dict[str, Any]]:
+        """Loads logged tissue loads and body part metadata backing the USL table."""
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT s.session_date, s.status, bp.body_part_id, bp.name as tissue_name, bp.tissue_type, tl.stress_score
+                    FROM athlete_sessions s
+                    JOIN tissue_loads_logged tl ON s.session_id = tl.session_id
+                    JOIN body_parts bp ON tl.body_part_id = bp.body_part_id
+                    WHERE s.athlete_id = %s
+                    ORDER BY s.session_date ASC;
+                    """,
+                    (athlete_id,)
+                )
+                return cur.fetchall()
+        finally:
+            conn.close()
+
     def load_sessions(self, athlete_id: str) -> List[Dict[str, Any]]:
         """Loads all recorded sessions for an athlete ordered by session_date."""
         conn = get_db_connection()
@@ -242,6 +281,61 @@ class ZetarisDBAdapter:
                 return cur.fetchall()
         finally:
             conn.close()
+
+
+    def swap_remediated_workout(
+        self,
+        session_id: str,
+        new_title: str,
+        remediated_text: str,
+        new_loads: List[Dict[str, Any]] = None,
+        new_status: str = "REMEDIATED_ACCEPTED"
+    ) -> bool:
+        """
+        Replaces a flagged session with its accepted remediation plan in Zetaris PostgreSQL.
+        Updates session metadata and replaces logged tissue loads.
+        """
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                # 1. Update session details and status
+                cur.execute(
+                    """
+                    UPDATE athlete_sessions
+                    SET session_title = %s,
+                        raw_input = %s,
+                        status = %s,
+                        remediation_suggestion = NULL
+                    WHERE session_id = %s;
+                    """,
+                    (new_title, remediated_text, new_status, session_id)
+                )
+
+                # 2. Update tissue loads if candidate loads were evaluated
+                if new_loads:
+                    cur.execute(
+                        "DELETE FROM tissue_loads_logged WHERE session_id = %s;",
+                        (session_id,)
+                    )
+                    for item in new_loads:
+                        cur.execute(
+                            """
+                            INSERT INTO tissue_loads_logged (session_id, body_part_id, stress_score, volume_mins)
+                            VALUES (%s, %s, %s, %s);
+                            """,
+                            (session_id, item["body_part_id"], item["stress_score"], item.get("volume_mins", 0))
+                        )
+
+            conn.commit()
+            logger.info(f"Successfully applied remediation swap for session {session_id}.")
+            return True
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Error applying remediation swap for session {session_id}: {e}")
+            return False
+        finally:
+            conn.close()
+
 
     def save_approved_session(
         self,

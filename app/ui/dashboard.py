@@ -1,4 +1,3 @@
-# app/ui/dashboard.py
 import calendar
 from datetime import date
 import reflex as rx
@@ -17,17 +16,17 @@ def get_status_badge(day_data) -> rx.Component:
         rx.cond(
             is_past,
             rx.cond(
-                day_data.has_violations,
-                rx.badge("LOGGED", color_scheme="amber", size="1", variant="soft"),
+                day_data.has_violations | (day_data.status == "HISTORICAL_WARNING"),
+                rx.badge("HIGH STRAIN", color_scheme="amber", size="1", variant="soft"),
                 rx.badge("LOGGED", color_scheme="green", size="1", variant="soft"),
             ),
             rx.cond(
                 day_data.status == "APPROVED",
                 rx.badge("APPROVED", color_scheme="green", size="1", variant="soft"),
                 rx.cond(
-                    day_data.status == "REMEDIATED",
-                    rx.badge("REMEDIATED", color_scheme="amber", size="1", variant="soft"),
-                    rx.badge("HIGH RISK", color_scheme="red", size="1", variant="soft"),
+                    (day_data.status == "REMEDIATED") | (day_data.status == "REMEDIATED_ACCEPTED"),
+                    rx.badge("REMEDIATED", color_scheme="blue", size="1", variant="soft"),
+                    rx.badge("RISK", color_scheme="amber", size="1", variant="soft"),
                 ),
             ),
         ),
@@ -398,8 +397,20 @@ def workout_logger_view() -> rx.Component:
                                 border_radius="6px",
                                 width="100%",
                             ),
+                            # Interactive Swap Action Button
+                            rx.cond(
+                                selected_day.status != "REMEDIATED_ACCEPTED",
+                                rx.button(
+                                    rx.icon(tag="check-check", size=16),
+                                    "Accept Alternative Routine",
+                                    color_scheme="amber",
+                                    variant="soft",
+                                    width="100%",
+                                    on_click=AppState.accept_remediation_plan(selected_day.session_id),
+                                ),
+                            ),
                             width="100%",
-                            spacing="2",
+                            spacing="3",
                         ),
                     ),
                     spacing="3",

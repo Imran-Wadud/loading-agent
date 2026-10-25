@@ -6,7 +6,7 @@ from pydantic import BaseModel
 import reflex as rx
 
 from app.graph import workload_graph
-from app.adapters.zetaris import get_db_connection
+from app.adapters.zetaris import get_db_connection, ZetarisDBAdapter
 
 
 class CalendarDay(BaseModel):
@@ -14,7 +14,8 @@ class CalendarDay(BaseModel):
     day_number: int
     is_current_month: bool
     session_title: Optional[str] = None
-    status: Optional[str] = None  # "APPROVED", "REMEDIATED", "HIGH RISK", "LOGGED"
+    session_id: Optional[str] = None
+    status: Optional[str] = None  # "APPROVED", "REMEDIATED", "HIGH RISK", "LOGGED", "PROPOSED_RISK_WARNING"
     has_violations: bool = False
     audit_flags: List[str] = []
     acwr: float = 1.0
@@ -99,24 +100,10 @@ class AppState(rx.State):
             self.expanded_week_index = week_idx
 
     def load_existing_sessions(self):
-        """Hydrates calendar_data and logged_tissue_loads from Zetaris PostgreSQL."""
+        """Hydrates calendar_data and logged_tissue_loads via Zetaris USL DB Adapter."""
         try:
-            db = get_db_connection()
-            query = """
-                SELECT session_id, athlete_id, session_date, session_title, 
-                       session_rpe, raw_input, status, acwr, remediation_suggestion
-                FROM athlete_sessions
-                WHERE athlete_id = %s
-                ORDER BY session_date ASC;
-            """
-            
-            if hasattr(db, "fetch_all"):
-                rows = db.fetch_all(query, (self.athlete_id,))
-            else:
-                from psycopg2.extras import RealDictCursor
-                with db.cursor(cursor_factory=RealDictCursor) as cursor:
-                    cursor.execute(query, (self.athlete_id,))
-                    rows = cursor.fetchall()
+            db_adapter = ZetarisDBAdapter()
+            rows = db_adapter.load_usl_sessions(self.athlete_id)
 
             # Initialize base grid structure for October 2026
             import calendar
@@ -132,9 +119,10 @@ class AppState(rx.State):
                             is_current_month=(d.month == 10 and d.year == 2026),
                         )
 
-            # Hydrate saved database records
+            # Hydrate saved USL database records
             for row in rows:
                 raw_s_date = row.get("session_date")
+                s_id_val = str(row.get("session_id")) if row.get("session_id") else None
                 title = row.get("session_title") or "Logged Session"
                 status_val = row.get("status") or "APPROVED"
                 raw_in = row.get("raw_input")
@@ -155,11 +143,12 @@ class AppState(rx.State):
 
                 has_viol = status_val not in ("APPROVED", "LOGGED")
 
-                day_entry = CalendarDay(
+                self.calendar_data[d_str] = CalendarDay(
                     date_str=d_str,
                     day_number=day_num,
                     is_current_month=(month_num == 10 and year_num == 2026),
                     session_title=title,
+                    session_id=s_id_val,
                     status=status_val,
                     has_violations=has_viol,
                     audit_flags=[f"Status: {status_val}"] if has_viol else [],
@@ -167,25 +156,9 @@ class AppState(rx.State):
                     remediation_suggestion=remediation,
                     raw_input=raw_in,
                 )
-                
-                self.calendar_data[d_str] = day_entry
 
-            # Query all logged tissue loads for dynamic per-tissue fatigue breakdown
-            tissue_query = """
-                SELECT s.session_date, s.status, bp.body_part_id, bp.name as tissue_name, bp.tissue_type, tl.stress_score
-                FROM athlete_sessions s
-                JOIN tissue_loads_logged tl ON s.session_id = tl.session_id
-                JOIN body_parts bp ON tl.body_part_id = bp.body_part_id
-                WHERE s.athlete_id = %s
-                ORDER BY s.session_date ASC;
-            """
-            if hasattr(db, "fetch_all"):
-                t_rows = db.fetch_all(tissue_query, (self.athlete_id,))
-            else:
-                from psycopg2.extras import RealDictCursor
-                with db.cursor(cursor_factory=RealDictCursor) as cursor:
-                    cursor.execute(tissue_query, (self.athlete_id,))
-                    t_rows = cursor.fetchall()
+            # Hydrate per-tissue fatigue breakdown via USL adapter
+            t_rows = db_adapter.load_usl_tissue_loads(self.athlete_id)
 
             parsed_tissue_loads = []
             for r in t_rows:
@@ -201,10 +174,49 @@ class AppState(rx.State):
                 })
             self.logged_tissue_loads = parsed_tissue_loads
 
-            self.status_message = f"Loaded {len(rows)} sessions from database."
+            self.status_message = f"Loaded {len(rows)} sessions via Zetaris USL."
         except Exception as e:
             self.status_message = f"DB Load Warning: {str(e)}"
 
+    def accept_remediation_plan(self, session_id: str):
+        """Swaps a flagged workout with its suggested alternative routine."""
+        db = ZetarisDBAdapter()
+        
+        # Locate target day in calendar_data matching session_id or selected_date_str
+        target_day = None
+        for day in self.calendar_data.values():
+            if day.session_id and str(day.session_id) == str(session_id):
+                target_day = day
+                break
+
+        if not target_day and self.selected_date_str in self.calendar_data:
+            target_day = self.calendar_data[self.selected_date_str]
+
+        if not target_day:
+            return
+
+        s_id = target_day.session_id or session_id
+        remediation_text = target_day.remediation_suggestion or ""
+        clean_title = (
+            (target_day.session_title or "Workout")
+            .replace("[RISK]", "")
+            .replace("[ADVISORY WARNING]", "")
+            .replace("[HIGH STRAIN]", "")
+            .strip()
+        )
+        new_title = f"[ADOPTED] {clean_title}"
+
+        # Execute DB update
+        success = db.swap_remediated_workout(
+            session_id=s_id,
+            new_title=new_title,
+            remediated_text=f"Accepted Remediation Plan:\n{remediation_text}",
+            new_status="REMEDIATED_ACCEPTED"
+        )
+
+        if success:
+            self.load_existing_sessions()
+    
     async def submit_workout_pipeline(self):
         """Delegates evaluation & downstream cascade strictly to LangGraph agent and refreshes UI state."""
         self.is_evaluating = True
@@ -265,7 +277,7 @@ class AppState(rx.State):
 
                 is_risk = False
                 if has_active_session:
-                    if session.has_violations or session.status in ("HIGH RISK", "REMEDIATED", "REJECTED_SAFETY_VIOLATION"):
+                    if session.has_violations or session.status in ("HIGH RISK", "REMEDIATED", "REJECTED_SAFETY_VIOLATION", "PROPOSED_RISK_WARNING"):
                         is_risk = True
 
                 is_recovering = False
@@ -296,7 +308,6 @@ class AppState(rx.State):
             all_weeks.append(week_days)
 
         return all_weeks
-
 
     @rx.var
     def weekly_tissue_fatigue(self) -> List[List[TissueFatigue]]:

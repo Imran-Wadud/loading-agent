@@ -1,6 +1,6 @@
 # app/ui/state.py
 import asyncio
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Any, Optional
 from pydantic import BaseModel
 import reflex as rx
@@ -20,6 +20,21 @@ class CalendarDay(BaseModel):
     acwr: float = 1.0
     remediation_suggestion: Optional[str] = None
     raw_input: Optional[str] = None
+
+
+class TissueDayStatus(BaseModel):
+    day_name: str
+    date_str: str
+    color: str
+    status_text: str
+    tooltip_text: str
+
+
+class TissueFatigue(BaseModel):
+    body_part_id: int
+    tissue_name: str
+    tissue_type: str
+    days: List[TissueDayStatus]
 
 
 class AppState(rx.State):
@@ -46,6 +61,9 @@ class AppState(rx.State):
 
     # Calendar Storage (Date string -> CalendarDay)
     calendar_data: Dict[str, CalendarDay] = {}
+
+    # Logged Tissue Loads for dynamic per-tissue fatigue bars
+    logged_tissue_loads: List[Dict[str, Any]] = []
 
     def set_athlete_id(self, val: str):
         self.athlete_id = val
@@ -81,7 +99,7 @@ class AppState(rx.State):
             self.expanded_week_index = week_idx
 
     def load_existing_sessions(self):
-        """Hydrates calendar_data from Zetaris PostgreSQL on app mount or after graph execution."""
+        """Hydrates calendar_data and logged_tissue_loads from Zetaris PostgreSQL."""
         try:
             db = get_db_connection()
             query = """
@@ -123,7 +141,6 @@ class AppState(rx.State):
                 acwr_val = row.get("acwr") or 1.0
                 remediation = row.get("remediation_suggestion")
 
-                # Standardize date to YYYY-MM-DD string
                 if isinstance(raw_s_date, (date, datetime)):
                     d_str = raw_s_date.strftime("%Y-%m-%d")
                     day_num = raw_s_date.day
@@ -152,6 +169,37 @@ class AppState(rx.State):
                 )
                 
                 self.calendar_data[d_str] = day_entry
+
+            # Query all logged tissue loads for dynamic per-tissue fatigue breakdown
+            tissue_query = """
+                SELECT s.session_date, s.status, bp.body_part_id, bp.name as tissue_name, bp.tissue_type, tl.stress_score
+                FROM athlete_sessions s
+                JOIN tissue_loads_logged tl ON s.session_id = tl.session_id
+                JOIN body_parts bp ON tl.body_part_id = bp.body_part_id
+                WHERE s.athlete_id = %s
+                ORDER BY s.session_date ASC;
+            """
+            if hasattr(db, "fetch_all"):
+                t_rows = db.fetch_all(tissue_query, (self.athlete_id,))
+            else:
+                from psycopg2.extras import RealDictCursor
+                with db.cursor(cursor_factory=RealDictCursor) as cursor:
+                    cursor.execute(tissue_query, (self.athlete_id,))
+                    t_rows = cursor.fetchall()
+
+            parsed_tissue_loads = []
+            for r in t_rows:
+                r_date = r["session_date"]
+                s_date_str = r_date.strftime("%Y-%m-%d") if isinstance(r_date, (date, datetime)) else str(r_date).split(" ")[0].split("T")[0]
+                parsed_tissue_loads.append({
+                    "session_date": s_date_str,
+                    "body_part_id": int(r["body_part_id"]),
+                    "tissue_name": str(r["tissue_name"]),
+                    "tissue_type": str(r["tissue_type"]),
+                    "stress_score": float(r.get("stress_score") or 5.0),
+                    "status": str(r.get("status") or "APPROVED"),
+                })
+            self.logged_tissue_loads = parsed_tissue_loads
 
             self.status_message = f"Loaded {len(rows)} sessions from database."
         except Exception as e:
@@ -183,27 +231,22 @@ class AppState(rx.State):
                         res.update(output)
             return res
 
-        # Run complete graph (consensus -> audit -> commit -> cascade_audit)
         await loop.run_in_executor(None, run_graph)
 
-        # Hydrate UI directly from updated PostgreSQL records
         self.load_existing_sessions()
         self.is_evaluating = False
         self.status_message = "Pipeline execution complete. Calendar synchronized."
 
     @rx.var
     def weekly_daily_fatigue(self) -> List[List[Dict[str, Any]]]:
-        """Dynamically computes day-by-day tissue status (Green: Rested, Yellow: Recovering, Red: Risk)."""
+        """Dynamically computes overall day-by-day tissue status (Green, Yellow, Red)."""
         import calendar
-        from datetime import date, timedelta
 
         cal = calendar.Calendar(firstweekday=0)
         month_weeks = cal.monthdatescalendar(2026, 10)
-
         day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         all_weeks = []
 
-        # Index all dates that have active sessions recorded
         active_session_dates = set()
         for d_str, day_data in self.calendar_data.items():
             if day_data.session_title and day_data.session_title != "No session":
@@ -220,13 +263,11 @@ class AppState(rx.State):
 
                 has_active_session = session and session.session_title and session.session_title != "No session"
 
-                # 1. RED: Biomechanical Risk / Safety Violation on this day
                 is_risk = False
                 if has_active_session:
                     if session.has_violations or session.status in ("HIGH RISK", "REMEDIATED", "REJECTED_SAFETY_VIOLATION"):
                         is_risk = True
 
-                # 2. YELLOW: Active Tissue Recovery Window (Workout today OR within 1-3 days after a prior workout)
                 is_recovering = False
                 if not is_risk:
                     for days_back in range(0, 4):
@@ -235,15 +276,14 @@ class AppState(rx.State):
                             is_recovering = True
                             break
 
-                # Assign color badge and tooltip label
                 if is_risk:
-                    color = "#ef4444"  # Red: High Risk / Lockout Collision
+                    color = "#ef4444"
                     status_text = "Risk / Violation Flagged"
                 elif is_recovering:
-                    color = "#f59e0b"  # Yellow: Active Tissue Remodeling / Recovery Window
+                    color = "#f59e0b"
                     status_text = "Active Tissue Recovery"
                 else:
-                    color = "#22c55e"  # Green: Fully Rested & Clear
+                    color = "#22c55e"
                     status_text = "Completely Rested"
 
                 week_days.append({
@@ -256,3 +296,96 @@ class AppState(rx.State):
             all_weeks.append(week_days)
 
         return all_weeks
+
+
+    @rx.var
+    def weekly_tissue_fatigue(self) -> List[List[TissueFatigue]]:
+        """Calculates per-tissue fatigue bars across each week (Mon-Sun)."""
+        import calendar
+
+        cal = calendar.Calendar(firstweekday=0)
+        month_weeks = cal.monthdatescalendar(2026, 10)
+        day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+        tissues_map = {}
+        for load in self.logged_tissue_loads:
+            b_id = load["body_part_id"]
+            if b_id not in tissues_map:
+                tissues_map[b_id] = {
+                    "tissue_name": load["tissue_name"],
+                    "tissue_type": load["tissue_type"],
+                    "loads": {}
+                }
+            tissues_map[b_id]["loads"][load["session_date"]] = load
+
+        all_weeks_tissues = []
+
+        for week_dates in month_weeks:
+            week_tissue_list = []
+
+            for b_id, t_info in tissues_map.items():
+                t_name = t_info["tissue_name"]
+                t_type = t_info["tissue_type"]
+                loads_dict = t_info["loads"]
+
+                window_days = 3 if t_type == "TENDON" else 2
+                days_status = []
+                has_active_day_in_week = False
+
+                for idx, d in enumerate(week_dates):
+                    d_str = str(d)
+
+                    worked_today = d_str in loads_dict
+
+                    worked_prior = False
+                    prior_date_str = None
+                    for lookback in range(1, window_days + 1):
+                        past_d_str = str(d - timedelta(days=lookback))
+                        if past_d_str in loads_dict:
+                            worked_prior = True
+                            prior_date_str = past_d_str
+                            break
+
+                    is_risk = False
+                    if worked_today and (worked_prior or (d_str in self.calendar_data and self.calendar_data[d_str].has_violations)):
+                        is_risk = True
+
+                    if is_risk:
+                        color = "#ef4444"
+                        status_text = f"{day_names[idx]}: {t_name} Lockout Collision"
+                        has_active_day_in_week = True
+                    elif worked_today:
+                        color = "#f59e0b"
+                        status_text = f"{day_names[idx]}: {t_name} Worked Today"
+                        has_active_day_in_week = True
+                    elif worked_prior:
+                        color = "#f59e0b"
+                        status_text = f"{day_names[idx]}: {t_name} Recovering (Worked {prior_date_str})"
+                        has_active_day_in_week = True
+                    else:
+                        color = "#22c55e"
+                        status_text = f"{day_names[idx]}: {t_name} Rested"
+
+                    days_status.append(
+                        TissueDayStatus(
+                            day_name=day_names[idx],
+                            date_str=d_str,
+                            color=color,
+                            status_text=status_text,
+                            tooltip_text=status_text,
+                        )
+                    )
+
+                if has_active_day_in_week:
+                    week_tissue_list.append(
+                        TissueFatigue(
+                            body_part_id=b_id,
+                            tissue_name=t_name,
+                            tissue_type=t_type,
+                            days=days_status,
+                        )
+                    )
+
+            all_weeks_tissues.append(week_tissue_list)
+
+        return all_weeks_tissues

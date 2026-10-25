@@ -16,13 +16,11 @@ def get_status_badge(day_data) -> rx.Component:
         has_session,
         rx.cond(
             is_past,
-            # Past Days: LOGGED (amber if violations else green)
             rx.cond(
                 day_data.has_violations,
                 rx.badge("LOGGED", color_scheme="amber", size="1", variant="soft"),
                 rx.badge("LOGGED", color_scheme="green", size="1", variant="soft"),
             ),
-            # Present / Future Days: APPROVED | REMEDIATED | HIGH RISK
             rx.cond(
                 day_data.status == "APPROVED",
                 rx.badge("APPROVED", color_scheme="green", size="1", variant="soft"),
@@ -63,7 +61,6 @@ def header_bar() -> rx.Component:
 
 
 def day_tile(d: date) -> rx.Component:
-    """Renders an individual calendar day card tile with fixed height, multi-line ellipsis truncation, and anchored bottom badge."""
     d_str = str(d)
     is_october = d.month == 10 and d.year == 2026
     day_data = AppState.calendar_data.get(d_str)
@@ -71,7 +68,6 @@ def day_tile(d: date) -> rx.Component:
 
     return rx.box(
         rx.vstack(
-            # Top Row: Day Number & Warning Icon
             rx.hstack(
                 rx.text(
                     f"{d.day}",
@@ -87,7 +83,6 @@ def day_tile(d: date) -> rx.Component:
                 width="100%",
                 align_items="center",
             ),
-            # Middle Area: Clamped Session Title with Explicit Multi-line Ellipsis (...)
             rx.box(
                 rx.cond(
                     has_session,
@@ -112,7 +107,6 @@ def day_tile(d: date) -> rx.Component:
                 overflow="hidden",
                 margin_y="0.2rem",
             ),
-            # Bottom Row: Fixed Badge Position
             rx.box(
                 get_status_badge(day_data),
                 width="100%",
@@ -141,39 +135,9 @@ def day_tile(d: date) -> rx.Component:
 
 
 def fatigue_summary_bar(week_idx: int) -> rx.Component:
-    """Renders weekly fatigue summary with a 7-day segment bar (Mon-Sun) showing load accumulation and rest-day decay."""
+    """Renders overall 7-day segment bar with an expandable scrollable per-tissue fatigue breakdown drawer."""
     week_days = AppState.weekly_daily_fatigue[week_idx]
-
-    cal = calendar.Calendar(firstweekday=0)
-    month_weeks = cal.monthdatescalendar(2026, 10)
-    week_dates = month_weeks[week_idx]
-
-    # Collect dynamic flag callouts for sessions in this week
-    week_flag_views = []
-    for d in week_dates:
-        d_str = str(d)
-        day_data = AppState.calendar_data.get(d_str)
-        has_flags = day_data & (day_data.session_title != None) & (day_data.session_title != "") & day_data.has_violations
-
-        week_flag_views.append(
-            rx.cond(
-                has_flags,
-                rx.vstack(
-                    rx.hstack(
-                        rx.icon(tag="shield-alert", size=14, color="var(--amber-9)"),
-                        rx.text(f"{d.strftime('%b %d')}: {day_data.session_title}", weight="bold", size="2"),
-                        spacing="2",
-                    ),
-                    rx.foreach(
-                        day_data.audit_flags,
-                        lambda flag: rx.text(flag, size="2", color="var(--gray-11)"),
-                    ),
-                    spacing="1",
-                    align_items="start",
-                    width="100%",
-                ),
-            )
-        )
+    week_tissues = AppState.weekly_tissue_fatigue[week_idx]
 
     return rx.vstack(
         rx.vstack(
@@ -220,14 +184,65 @@ def fatigue_summary_bar(week_idx: int) -> rx.Component:
             _hover={"border_color": "var(--accent-8)", "background_color": "var(--gray-3)"},
             on_click=AppState.toggle_week_fatigue(week_idx),
         ),
-        # Expandable Biomechanical Lockout Drawer (Dynamic per week)
+        # Expandable Biomechanical Tissue Fatigue Drawer (Scrollable)
         rx.cond(
             AppState.expanded_week_index == week_idx,
             rx.box(
                 rx.vstack(
-                    rx.text("Active Biomechanical Lockout Diagnostics", weight="bold", size="2"),
-                    *week_flag_views,
-                    spacing="2",
+                    rx.hstack(
+                        rx.text("Active Biomechanical Tissue Recovery", weight="bold", size="2"),
+                        rx.spacer(),
+                        rx.text("Individual Mon-Sun Fatigue Progression", size="1", color="var(--gray-10)"),
+                        width="100%",
+                        align_items="center",
+                    ),
+                    rx.cond(
+                        week_tissues.length() == 0,
+                        rx.text("All tissues fully rested. No active tissue recovery lockouts for this week.", size="2", color="var(--gray-10)"),
+                        rx.box(
+                            rx.vstack(
+                                rx.foreach(
+                                    week_tissues,
+                                    lambda t: rx.hstack(
+                                        rx.hstack(
+                                            rx.text(t.tissue_name, weight="bold", size="2", style={"minWidth": "140px"}),
+                                            rx.badge(t.tissue_type, size="1", variant="soft", color_scheme="gray"),
+                                            spacing="2",
+                                            align_items="center",
+                                            width="210px",
+                                        ),
+                                        rx.grid(
+                                            rx.foreach(
+                                                t.days,
+                                                lambda d: rx.tooltip(
+                                                    rx.box(
+                                                        height="8px",
+                                                        background_color=d.color,
+                                                        border_radius="3px",
+                                                        width="100%",
+                                                    ),
+                                                    content=d.tooltip_text,
+                                                ),
+                                            ),
+                                            columns="7",
+                                            spacing="1",
+                                            flex="1",
+                                        ),
+                                        width="100%",
+                                        align_items="center",
+                                        spacing="3",
+                                    ),
+                                ),
+                                spacing="2",
+                                width="100%",
+                            ),
+                            max_height="180px",
+                            overflow_y="auto",
+                            padding_right="0.5rem",
+                            width="100%",
+                        ),
+                    ),
+                    spacing="3",
                     padding="0.8rem 1rem",
                 ),
                 background_color="var(--gray-3)",
@@ -244,7 +259,6 @@ def fatigue_summary_bar(week_idx: int) -> rx.Component:
 
 
 def calendar_grid_view() -> rx.Component:
-    """Renders 5 weeks of 7 days matching October 2026."""
     days_header = rx.grid(
         *[
             rx.center(rx.text(day, weight="bold", size="2", color="gray"))
@@ -273,7 +287,6 @@ def calendar_grid_view() -> rx.Component:
 
 
 def workout_logger_view() -> rx.Component:
-    """Split-screen view: Left = Input Form, Right = Session Details & Audit Results."""
     selected_day = AppState.calendar_data.get(AppState.selected_date_str)
     has_session = selected_day & (selected_day.session_title != None) & (selected_day.session_title != "")
 

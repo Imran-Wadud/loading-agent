@@ -41,6 +41,9 @@ class WorkloadState(TypedDict):
     remediation_attempts: int
     evaluator_approved: Optional[bool]
     
+    # Cascade Audit Outputs
+    downstream_conflicts: Optional[List[Dict[str, Any]]]
+    
     # Final Outcome
     final_status: Optional[str]
 
@@ -227,32 +230,92 @@ def evaluator_node(state: WorkloadState) -> Dict[str, Any]:
         return {"evaluator_approved": False}
 
 
-def commit_node(state: WorkloadState) -> Dict[str, Any]:
-    """Node 5: Commits approved state to PostgreSQL / Zetaris."""
-    outcome = "APPROVED" if state.get("audit_approved") else "REMEDIATED_APPROVED"
-    logger.info(f"--- [LangGraph] Final Commit Node. Outcome: {outcome} ---")
-    
-    log_agent_step(
-        agent_name="CommitAdapter",
-        action="database_persistence",
-        details={
-            "athlete_id": state["athlete_id"],
-            "session_title": state.get("session_title"),
-            "final_status": outcome
-        }
+def commit_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Persists evaluated session and tissue loads into Zetaris PostgreSQL."""
+    athlete_id = state["athlete_id"]
+    session_date = state["session_date"]
+    session_title = state.get("session_title", "Logged Workout")
+    raw_input = state["raw_input"]
+    session_rpe = state.get("session_rpe")
+    consensus_loads = state.get("consensus_loads", [])
+    status = state.get("final_status", "APPROVED")
+    acwr = state.get("acwr", 1.0)
+    remediation_suggestion = state.get("remediation_suggestion")
+
+    db_adapter = ZetarisDBAdapter()
+    session_id = db_adapter.save_approved_session(
+        athlete_id=athlete_id,
+        session_date=session_date,
+        session_title=session_title,
+        raw_text=raw_input,
+        session_rpe=session_rpe,
+        consensus_loads=consensus_loads,
+        status=status,
+        acwr=acwr,
+        remediation_suggestion=remediation_suggestion
     )
+
+    return {"session_id": session_id}
+
+
+def cascade_audit_node(state: WorkloadState) -> Dict[str, Any]:
+    """Node 5: Re-audits downstream sessions and generates AI remediation plans for any newly flagged workouts."""
+    logger.info("--- [LangGraph] Entering Cascade Audit Node ---")
+    
+    athlete_id = state["athlete_id"]
+    session_date = state["session_date"]
     
     db_adapter = ZetarisDBAdapter()
-    db_adapter.save_approved_session(
-        athlete_id=state["athlete_id"],
-        session_date=state["session_date"],
-        session_title=state.get("session_title", "Logged Session"),
-        raw_text=state["raw_input"],
-        session_rpe=state.get("session_rpe"),
-        consensus_loads=state.get("consensus_loads", [])
-    )
+    world_model = WorldModelEngine(db_adapter)
     
-    return {"final_status": outcome}
+    # 1. World Model identifies downstream sessions in violation
+    flagged_sessions = world_model.audit_downstream_timeline(athlete_id, session_date)
+    
+    if flagged_sessions:
+        llm = get_meterless_llm()
+        
+        for item in flagged_sessions:
+            s_id = item["session_id"]
+            s_date = item["session_date"]
+            sim_res = item["sim_result"]
+            flags = [v.get("message", str(v)) for v in sim_res.get("violations", [])]
+            
+            # 2. Synthesize remediation plan for downstream conflict
+            system_prompt = (
+                "You are an expert Strength & Conditioning Biomechanics Agent.\n"
+                "A backfilled workout on a prior date has created a downstream tissue lockout conflict for this session.\n"
+                "Generate an alternative, modified training plan or targeted rest protocol that resolves these flags:"
+            )
+            user_prompt = (
+                f"Athlete: {athlete_id}\n"
+                f"Session Date: {s_date}\n"
+                f"Title: {item.get('session_title')}\n"
+                f"Original Workout: {item.get('raw_input')}\n"
+                f"Active Recovery Flags:\n" + "\n".join([f"- {f}" for f in flags])
+            )
+            
+            response = llm.invoke([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ])
+            
+            # 3. Persist remediated plan back to PostgreSQL
+            db_adapter.update_session_remediation(
+                session_id=s_id,
+                status="REMEDIATED",
+                remediation_suggestion=response.content
+            )
+            
+        log_agent_step(
+            agent_name="WorldModelEngine",
+            action="downstream_cascade_remediation",
+            details={
+                "athlete_id": athlete_id,
+                "remediated_downstream_count": len(flagged_sessions)
+            }
+        )
+
+    return {"downstream_conflicts": flagged_sessions}
 
 
 # =====================================================================
@@ -269,8 +332,8 @@ def route_remediation(state: WorkloadState) -> str:
     if state.get("evaluator_approved"):
         return "commit"
     if state.get("remediation_attempts", 0) >= 3:
-        logger.warning("Max remediation retry attempts reached (3). Route to END.")
-        return "max_retries_reached"
+        logger.warning("Max remediation retry attempts reached (3). Route to cascade_audit.")
+        return "cascade_audit"
     return "remediate"
 
 
@@ -285,6 +348,7 @@ builder.add_node("audit", audit_node)
 builder.add_node("remediate", remediate_node)
 builder.add_node("evaluator", evaluator_node)
 builder.add_node("commit", commit_node)
+builder.add_node("cascade_audit", cascade_audit_node)
 
 builder.set_entry_point("consensus")
 builder.add_edge("consensus", "audit")
@@ -306,10 +370,11 @@ builder.add_conditional_edges(
     {
         "commit": "commit",
         "remediate": "remediate",
-        "max_retries_reached": END
+        "cascade_audit": "cascade_audit"
     }
 )
 
-builder.add_edge("commit", END)
+builder.add_edge("commit", "cascade_audit")
+builder.add_edge("cascade_audit", END)
 
 workload_graph = builder.compile()

@@ -30,6 +30,9 @@ CREATE TABLE athlete_sessions (
     session_title VARCHAR(200),
     raw_input TEXT NOT NULL,
     session_rpe NUMERIC(3,1) CHECK (session_rpe BETWEEN 1.0 AND 10.0),
+    status VARCHAR(50) DEFAULT 'APPROVED',
+    acwr NUMERIC(4,2) DEFAULT 1.00,
+    remediation_suggestion TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 

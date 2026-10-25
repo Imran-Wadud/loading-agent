@@ -57,20 +57,24 @@ def persist_session_and_loads(
     session_title: str,
     raw_text: str,
     session_rpe: Optional[float],
-    consensus_loads: List[Dict[str, Any]]
+    consensus_loads: List[Dict[str, Any]],
+    status: str = "APPROVED",
+    acwr: float = 1.0,
+    remediation_suggestion: Optional[str] = None
 ) -> str:
-    """Persists approved session and corresponding tissue loads into Zetaris PostgreSQL."""
+    """Persists session, audit outcome, and corresponding tissue loads into Zetaris PostgreSQL."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # 1. Insert session
+            # 1. Insert session with complete audit state
             cur.execute(
                 """
-                INSERT INTO athlete_sessions (athlete_id, session_date, session_title, raw_input, session_rpe)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO athlete_sessions (
+                    athlete_id, session_date, session_title, raw_input, session_rpe, status, acwr, remediation_suggestion
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING session_id;
                 """,
-                (athlete_id, session_date, session_title, raw_text, session_rpe)
+                (athlete_id, session_date, session_title, raw_text, session_rpe, status, acwr, remediation_suggestion)
             )
             session_id = cur.fetchone()["session_id"]
             logger.info(f"Created athlete_sessions record UUID: {session_id}")
@@ -103,6 +107,67 @@ class ZetarisDBAdapter:
 
     def get_canonical_body_parts(self) -> List[Dict[str, Any]]:
         return fetch_canonical_body_parts()
+
+    def load_sessions(self, athlete_id: str) -> List[Dict[str, Any]]:
+        """Loads all recorded sessions for an athlete ordered by session_date."""
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT session_id, athlete_id, session_date, session_title, 
+                           session_rpe, raw_input, status, acwr, remediation_suggestion
+                    FROM athlete_sessions
+                    WHERE athlete_id = %s
+                    ORDER BY session_date ASC;
+                    """,
+                    (athlete_id,)
+                )
+                return cur.fetchall()
+        finally:
+            conn.close()
+
+    def get_session_tissue_loads(self, session_id: str) -> List[Dict[str, Any]]:
+        """Loads all logged tissue loads mapped to a specific session_id."""
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT tl.body_part_id, bp.name, bp.tissue_type, tl.stress_score, tl.volume_mins
+                    FROM tissue_loads_logged tl
+                    JOIN body_parts bp ON tl.body_part_id = bp.body_part_id
+                    WHERE tl.session_id = %s;
+                    """,
+                    (session_id,)
+                )
+                return cur.fetchall()
+        finally:
+            conn.close()
+
+    def update_session_remediation(
+        self, session_id: str, status: str, remediation_suggestion: str
+    ):
+        """Updates the status and remediation plan for a session in PostgreSQL."""
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE athlete_sessions
+                    SET status = %s, remediation_suggestion = %s
+                    WHERE session_id = %s;
+                    """,
+                    (status, remediation_suggestion, session_id)
+                )
+            conn.commit()
+            logger.info(f"Updated session {session_id} status to {status}.")
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Error updating session remediation: {e}")
+            raise e
+        finally:
+            conn.close()
 
     def fetch_historical_daily_loads(self, athlete_id: str, target_date: date, days: int = 28) -> Dict[date, float]:
         """
@@ -156,8 +221,19 @@ class ZetarisDBAdapter:
         session_title: str,
         raw_text: str,
         session_rpe: Optional[float],
-        consensus_loads: List[Dict[str, Any]]
+        consensus_loads: List[Dict[str, Any]],
+        status: str = "APPROVED",
+        acwr: float = 1.0,
+        remediation_suggestion: Optional[str] = None
     ) -> str:
         return persist_session_and_loads(
-            athlete_id, session_date, session_title, raw_text, session_rpe, consensus_loads
+            athlete_id=athlete_id,
+            session_date=session_date,
+            session_title=session_title,
+            raw_text=raw_text,
+            session_rpe=session_rpe,
+            consensus_loads=consensus_loads,
+            status=status,
+            acwr=acwr,
+            remediation_suggestion=remediation_suggestion
         )

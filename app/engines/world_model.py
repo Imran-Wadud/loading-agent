@@ -28,6 +28,50 @@ class WorldModelEngine:
         else:
             return "DISTANT_PAST"
 
+    def audit_downstream_timeline(self, athlete_id: str, from_date: date) -> List[Dict[str, Any]]:
+        """
+        Scans all sessions on or after `from_date` stored in PostgreSQL.
+        Re-evaluates each downstream session against updated tissue loads using simulate_state_delta.
+        """
+        sessions = self.db_adapter.load_sessions(athlete_id)
+        flagged_sessions = []
+
+        # Filter downstream sessions chronologically
+        downstream = []
+        for s in sessions:
+            s_date = s["session_date"]
+            if isinstance(s_date, str):
+                s_date = date.fromisoformat(s_date)
+            if s_date > from_date:
+                downstream.append((s_date, s))
+        
+        downstream.sort(key=lambda x: x[0])
+
+        for s_date, s in downstream:
+            # Fetch extracted tissue loads already stored in DB for this session
+            tissue_loads = self.db_adapter.get_session_tissue_loads(s["session_id"])
+            if not tissue_loads:
+                continue
+
+            # Run full state delta simulation preserving all temporal tiers & RPE rules
+            sim_res = self.simulate_state_delta(
+                athlete_id=athlete_id,
+                session_date=s_date,
+                extracted_loads=tissue_loads,
+                session_rpe=float(s.get("session_rpe") or 8.0),
+            )
+
+            if not sim_res["simulation_approved"]:
+                flagged_sessions.append({
+                    "session_id": s["session_id"],
+                    "session_date": s_date,
+                    "session_title": s.get("session_title"),
+                    "raw_input": s.get("raw_input"),
+                    "sim_result": sim_res,
+                })
+
+        return flagged_sessions
+
     def simulate_state_delta(
         self,
         athlete_id: str,
@@ -90,6 +134,9 @@ class WorldModelEngine:
                         prev_date = date.fromisoformat(prev_date)
                         
                     delta_days = (session_date - prev_date).days
+                    if delta_days <= 0:
+                        continue
+
                     delta_hours = max(0.0, delta_days * 24.0)
                     
                     if delta_hours < required_window_hours and prev["stress_score"] >= 5.0 and stress_score >= 5.0:
@@ -119,25 +166,26 @@ class WorldModelEngine:
         past_28_days = [session_date - timedelta(days=i) for i in range(28)]
         past_7_days = past_28_days[:7]
 
+        # Count active training days in the 28-day window
+        active_days_count = sum(1 for d in past_28_days if history_map.get(d, 0.0) > 0.0)
+
         acute_load = sum(history_map.get(d, 0.0) for d in past_7_days) / 7.0
         chronic_load = sum(history_map.get(d, 0.0) for d in past_28_days) / 28.0
-        acwr = round(acute_load / chronic_load, 2) if chronic_load > 0.0 else 1.0
 
-        if acwr > 1.5 and temporal_tier != "DISTANT_PAST":
+        # Cold-Start Protection: Require >= 3 active days to calculate ACWR spike
+        if active_days_count < 3:
+            acwr = 1.0
+            logger.info(f"[World Model Engine] Baseline building ({active_days_count}/3 active days). ACWR defaulted to 1.0.")
+        else:
+            acwr = round(acute_load / chronic_load, 2) if chronic_load > 0.0 else 1.0
+
+        if acwr > 1.5 and temporal_tier != "DISTANT_PAST" and active_days_count >= 3:
             violations.append({
                 "type": "ACWR_SPIKE",
                 "severity": "CRITICAL" if temporal_tier == "FUTURE_OR_TODAY" else "WARNING",
                 "temporal_tier": temporal_tier,
                 "entity": "SYSTEM_ACWR",
                 "message": f"ACWR spike ({acwr} > 1.5). 7-day acute workload rapidly exceeding 28-day chronic capacity."
-            })
-        elif acwr > 1.5 and temporal_tier == "DISTANT_PAST":
-            violations.append({
-                "type": "HISTORICAL_ACWR_RECALIBRATION",
-                "severity": "INFO",
-                "temporal_tier": temporal_tier,
-                "entity": "SYSTEM_ACWR",
-                "message": f"Retroactive session logging updated chronic baseline. Calculated past ACWR was {acwr}."
             })
 
         simulation_approved = not any(v.get("severity") == "CRITICAL" for v in violations)

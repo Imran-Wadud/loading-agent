@@ -1,3 +1,7 @@
+*.py[cod]
+.states
+.web
+assets/external/
 # Environment & Local Secrets
 .env
 *.env

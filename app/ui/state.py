@@ -23,6 +23,19 @@ class CalendarDay(BaseModel):
     raw_input: Optional[str] = None
 
 
+class CalendarGridCell(BaseModel):
+    """Structured data type for calendar grid components."""
+    date_str: str
+    day_number: int
+    is_current_month: bool
+    is_past: bool
+    session_title: str
+    session_id: str
+    status: str
+    has_violations: bool
+    acwr: float
+
+
 class TissueDayStatus(BaseModel):
     day_name: str
     date_str: str
@@ -45,11 +58,13 @@ class AppState(rx.State):
     current_view: str = "calendar"  # "calendar" | "logger"
     selected_date_str: str = str(date.today())
 
+    # Dynamic Month & Year Navigation (Defaults to current real-world date)
+    current_month: int = date.today().month
+    current_year: int = date.today().year
+
     # Form Inputs
     session_title_input: str = ""
-    workout_description_input: str = (
-        "Upper body hypertrophy: Dumbbell Bench Press 4x10, Lat Pulldowns 4x12, Bicep Curls 3x15"
-    )
+    workout_description_input: str = ""
     session_rpe_input: float = 8.5
     athlete_id: str = "athlete_001"
 
@@ -78,15 +93,34 @@ class AppState(rx.State):
         elif isinstance(val, (int, float)):
             self.session_rpe_input = float(val)
 
+    def prev_month(self):
+        """Navigate to the previous month."""
+        if self.current_month == 1:
+            self.current_month = 12
+            self.current_year -= 1
+        else:
+            self.current_month -= 1
+        self.load_existing_sessions()
+
+    def next_month(self):
+        """Navigate to the next month."""
+        if self.current_month == 12:
+            self.current_month = 1
+            self.current_year += 1
+        else:
+            self.current_month += 1
+        self.load_existing_sessions()
+
     def select_day_for_logging(self, date_str: str):
-        """Navigate to workout logger/detail split view for selected date."""
+        """Navigate to workout logger/detail split view for selected date and clear stale input."""
         self.selected_date_str = date_str
         self.current_view = "logger"
 
         if date_str in self.calendar_data:
             existing = self.calendar_data[date_str]
-            if existing.raw_input:
-                self.workout_description_input = existing.raw_input
+            self.workout_description_input = existing.raw_input if existing and existing.raw_input else ""
+        else:
+            self.workout_description_input = ""
 
     def nav_to_calendar(self):
         """Return to main calendar view."""
@@ -105,10 +139,10 @@ class AppState(rx.State):
             db_adapter = ZetarisDBAdapter()
             rows = db_adapter.load_usl_sessions(self.athlete_id)
 
-            # Initialize base grid structure for October 2026
+            # Initialize base grid structure for current active month and year
             import calendar
             cal = calendar.Calendar(firstweekday=0)
-            month_weeks = cal.monthdatescalendar(2026, 10)
+            month_weeks = cal.monthdatescalendar(self.current_year, self.current_month)
             for week in month_weeks:
                 for d in week:
                     d_str = str(d)
@@ -116,7 +150,7 @@ class AppState(rx.State):
                         self.calendar_data[d_str] = CalendarDay(
                             date_str=d_str,
                             day_number=d.day,
-                            is_current_month=(d.month == 10 and d.year == 2026),
+                            is_current_month=(d.month == self.current_month and d.year == self.current_year),
                         )
 
             # Hydrate saved USL database records
@@ -146,7 +180,7 @@ class AppState(rx.State):
                 self.calendar_data[d_str] = CalendarDay(
                     date_str=d_str,
                     day_number=day_num,
-                    is_current_month=(month_num == 10 and year_num == 2026),
+                    is_current_month=(month_num == self.current_month and year_num == self.current_year),
                     session_title=title,
                     session_id=s_id_val,
                     status=status_val,
@@ -182,7 +216,6 @@ class AppState(rx.State):
         """Swaps a flagged workout with its suggested alternative routine."""
         db = ZetarisDBAdapter()
         
-        # Locate target day in calendar_data matching session_id or selected_date_str
         target_day = None
         for day in self.calendar_data.values():
             if day.session_id and str(day.session_id) == str(session_id):
@@ -206,7 +239,6 @@ class AppState(rx.State):
         )
         new_title = f"[ADOPTED] {clean_title}"
 
-        # Execute DB update
         success = db.swap_remediated_workout(
             session_id=s_id,
             new_title=new_title,
@@ -251,11 +283,11 @@ class AppState(rx.State):
 
     @rx.var
     def weekly_daily_fatigue(self) -> List[List[Dict[str, Any]]]:
-        """Dynamically computes overall day-by-day tissue status (Green, Yellow, Red)."""
+        """Dynamically computes overall day-by-day tissue status for the active month view."""
         import calendar
 
         cal = calendar.Calendar(firstweekday=0)
-        month_weeks = cal.monthdatescalendar(2026, 10)
+        month_weeks = cal.monthdatescalendar(self.current_year, self.current_month)
         day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         all_weeks = []
 
@@ -310,12 +342,43 @@ class AppState(rx.State):
         return all_weeks
 
     @rx.var
+    def month_calendar_weeks(self) -> List[List[CalendarGridCell]]:
+        """Generates a 2D grid of structured CalendarGridCells for the active month."""
+        import calendar
+        cal = calendar.Calendar(firstweekday=0)
+        weeks = cal.monthdatescalendar(self.current_year, self.current_month)
+        today_str = str(date.today())
+        
+        result = []
+        for week in weeks:
+            week_list = []
+            for d in week:
+                d_str = str(d)
+                day_data = self.calendar_data.get(d_str)
+                
+                week_list.append(
+                    CalendarGridCell(
+                        date_str=d_str,
+                        day_number=d.day,
+                        is_current_month=(d.month == self.current_month and d.year == self.current_year),
+                        is_past=(d_str < today_str),
+                        session_title=day_data.session_title if day_data and day_data.session_title else "",
+                        session_id=str(day_data.session_id) if day_data and day_data.session_id else "",
+                        status=day_data.status if day_data and day_data.status else "",
+                        has_violations=day_data.has_violations if day_data else False,
+                        acwr=float(day_data.acwr) if day_data else 1.0,
+                    )
+                )
+            result.append(week_list)
+        return result
+
+    @rx.var
     def weekly_tissue_fatigue(self) -> List[List[TissueFatigue]]:
-        """Calculates per-tissue fatigue bars across each week (Mon-Sun)."""
+        """Calculates per-tissue fatigue bars across each week for the active month view."""
         import calendar
 
         cal = calendar.Calendar(firstweekday=0)
-        month_weeks = cal.monthdatescalendar(2026, 10)
+        month_weeks = cal.monthdatescalendar(self.current_year, self.current_month)
         day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
         tissues_map = {}

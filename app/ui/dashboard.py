@@ -2,14 +2,16 @@ import calendar
 from datetime import date
 import reflex as rx
 
-from app.ui.state import AppState, CalendarDay
+from app.ui.state import AppState, CalendarDay, CalendarGridCell
 
 
 def get_status_badge(day_data) -> rx.Component:
-    """Renders temporal status badges using rx.cond for compilation safety."""
+    """Renders temporal status badges for the workout logger detail view (using reactive state)."""
     today_str = str(date.today())
     is_past = day_data.date_str < today_str
-    has_session = day_data & (day_data.session_title != None) & (day_data.session_title != "")
+    
+    # Safe reactive null/empty check
+    has_session = day_data & (day_data.session_title != "")
 
     return rx.cond(
         has_session,
@@ -39,7 +41,7 @@ def header_bar() -> rx.Component:
         rx.vstack(
             rx.heading("Athletic Workload & Recovery Dashboard", size="6", weight="bold"),
             rx.hstack(
-                rx.text("October 2026", weight="bold", color="var(--accent-9)"),
+                rx.text(f"Active View: {AppState.current_month} / {AppState.current_year}", weight="bold", color="var(--accent-9)"),
                 rx.text("| Biomechanical Consensus & World Model Audit Engine", color="gray"),
                 spacing="2",
             ),
@@ -59,24 +61,24 @@ def header_bar() -> rx.Component:
     )
 
 
-def day_tile(d: date) -> rx.Component:
-    d_str = str(d)
-    is_october = d.month == 10 and d.year == 2026
-    day_data = AppState.calendar_data.get(d_str)
-    has_session = day_data & (day_data.session_title != None) & (day_data.session_title != "")
+def day_tile_item(day_info: CalendarGridCell) -> rx.Component:
+    d_str = day_info.date_str
+    day_num = day_info.day_number.to_string()
+    is_curr_m = day_info.is_current_month
+    has_session = day_info.session_title != ""
 
     return rx.box(
         rx.vstack(
             rx.hstack(
                 rx.text(
-                    f"{d.day}",
+                    day_num,
                     weight="bold",
                     size="2",
-                    color=rx.cond(is_october, "var(--gray-12)", "var(--gray-8)"),
+                    color=rx.cond(is_curr_m, "var(--gray-12)", "var(--gray-8)"),
                 ),
                 rx.spacer(),
                 rx.cond(
-                    has_session & day_data.has_violations,
+                    has_session & day_info.has_violations,
                     rx.icon(tag="triangle-alert", size=14, color="var(--red-9)"),
                 ),
                 width="100%",
@@ -86,7 +88,7 @@ def day_tile(d: date) -> rx.Component:
                 rx.cond(
                     has_session,
                     rx.text(
-                        day_data.session_title,
+                        day_info.session_title,
                         size="1",
                         weight="medium",
                         color="var(--gray-11)",
@@ -107,7 +109,7 @@ def day_tile(d: date) -> rx.Component:
                 margin_y="0.2rem",
             ),
             rx.box(
-                get_status_badge(day_data),
+                get_status_badge(day_info),
                 width="100%",
             ),
             height="100%",
@@ -120,7 +122,7 @@ def day_tile(d: date) -> rx.Component:
         border="1px solid var(--gray-4)",
         border_radius="8px",
         cursor="pointer",
-        opacity=rx.cond(is_october, "1.0", "0.45"),
+        opacity=rx.cond(is_curr_m, "1.0", "0.45"),
         background_color=rx.cond(
             AppState.selected_date_str == d_str,
             "var(--accent-3)",
@@ -258,6 +260,29 @@ def fatigue_summary_bar(week_idx: int) -> rx.Component:
 
 
 def calendar_grid_view() -> rx.Component:
+    month_navigator = rx.hstack(
+        rx.heading(f"Month: {AppState.current_month} / {AppState.current_year}", size="4", weight="bold"),
+        rx.hstack(
+            rx.button(
+                rx.icon(tag="chevron-left", size=18),
+                on_click=AppState.prev_month,
+                variant="soft",
+                color_scheme="gray",
+            ),
+            rx.button(
+                rx.icon(tag="chevron-right", size=18),
+                on_click=AppState.next_month,
+                variant="soft",
+                color_scheme="gray",
+            ),
+            spacing="2",
+        ),
+        justify="between",
+        align_items="center",
+        width="100%",
+        padding_bottom="0.5rem",
+    )
+
     days_header = rx.grid(
         *[
             rx.center(rx.text(day, weight="bold", size="2", color="gray"))
@@ -268,18 +293,23 @@ def calendar_grid_view() -> rx.Component:
         padding_y="0.5rem",
     )
 
-    cal = calendar.Calendar(firstweekday=0)
-    month_weeks = cal.monthdatescalendar(2026, 10)
-
-    weeks_components = []
-    for week_idx, week_dates in enumerate(month_weeks):
-        week_tiles = [day_tile(d) for d in week_dates]
-        week_grid = rx.grid(*week_tiles, columns="7", spacing="2", width="100%")
-        weeks_components.extend([week_grid, fatigue_summary_bar(week_idx)])
-
     return rx.vstack(
+        month_navigator,
         days_header,
-        *weeks_components,
+        rx.foreach(
+            AppState.month_calendar_weeks,
+            lambda week, index: rx.vstack(
+                rx.grid(
+                    rx.foreach(week, lambda day_info: day_tile_item(day_info)),
+                    columns="7",
+                    spacing="2",
+                    width="100%",
+                ),
+                fatigue_summary_bar(index),
+                width="100%",
+                spacing="2",
+            ),
+        ),
         width="100%",
         spacing="3",
     )
@@ -320,6 +350,7 @@ def workout_logger_view() -> rx.Component:
                 rx.text_area(
                     value=AppState.workout_description_input,
                     on_change=AppState.set_workout_description_input,
+                    placeholder="Enter your workout",
                     rows="5",
                     width="100%",
                 ),

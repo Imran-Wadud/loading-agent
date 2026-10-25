@@ -259,7 +259,7 @@ def commit_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def cascade_audit_node(state: WorkloadState) -> Dict[str, Any]:
-    """Node 5: Re-audits downstream sessions and generates AI remediation plans for any newly flagged workouts."""
+    """Node 5: Persists terminal candidate rejection to DB and re-audits downstream sessions."""
     logger.info("--- [LangGraph] Entering Cascade Audit Node ---")
     
     athlete_id = state["athlete_id"]
@@ -268,9 +268,46 @@ def cascade_audit_node(state: WorkloadState) -> Dict[str, Any]:
     db_adapter = ZetarisDBAdapter()
     world_model = WorldModelEngine(db_adapter)
     
-    # 1. World Model identifies downstream sessions in violation
-    flagged_sessions = world_model.audit_downstream_timeline(athlete_id, session_date)
-    
+    # 1. Handle primary candidate session rejection persistence
+    candidate_approved = state.get("simulation_approved", False)
+    current_session_id = state.get("session_id")
+    current_status = state.get("status", "REJECTED_SAFETY_VIOLATION")
+    current_remediation = state.get("remediation_suggestion") or ""
+
+    if not candidate_approved and not current_session_id:
+        if not current_remediation:
+            violations = state.get("violations", [])
+            flags_str = "\n".join([f"- {v.get('message', str(v))}" for v in violations]) or "- ACWR safety threshold breach"
+            current_remediation = (
+                f"🚨 SAFETY AUDIT REJECTION\n"
+                f"This workout was rejected after 3 remediation attempts due to high cumulative fatigue:\n"
+                f"{flags_str}\n\n"
+                f"Recommended Action: Complete rest or low-intensity active mobility."
+            )
+
+        try:
+            current_session_id = db_adapter.save_approved_session(
+                athlete_id=athlete_id,
+                session_date=session_date,
+                session_title=f"[REJECTED] {state.get('session_title', 'Workout')}",
+                raw_text=state.get("raw_text", ""),
+                session_rpe=state.get("session_rpe"),
+                consensus_loads=state.get("consensus_loads", []),
+                status="REJECTED_SAFETY_VIOLATION",
+                acwr=float(state.get("acwr", 1.0)),
+                remediation_suggestion=current_remediation
+            )
+            logger.info(f"[Cascade Audit Node] Saved candidate rejection record: {current_session_id}")
+        except Exception as e:
+            logger.error(f"[Cascade Audit Node] Error saving candidate rejection: {e}")
+
+    # 2. World Model identifies downstream sessions in violation
+    flagged_sessions = []
+    try:
+        flagged_sessions = world_model.audit_downstream_timeline(athlete_id, session_date)
+    except Exception as e:
+        logger.error(f"[Cascade Audit Node] Error auditing downstream timeline: {e}")
+
     if flagged_sessions:
         llm = get_meterless_llm()
         
@@ -280,7 +317,7 @@ def cascade_audit_node(state: WorkloadState) -> Dict[str, Any]:
             sim_res = item["sim_result"]
             flags = [v.get("message", str(v)) for v in sim_res.get("violations", [])]
             
-            # 2. Synthesize remediation plan for downstream conflict
+            # Synthesize remediation plan for downstream conflict
             system_prompt = (
                 "You are an expert Strength & Conditioning Biomechanics Agent.\n"
                 "A backfilled workout on a prior date has created a downstream tissue lockout conflict for this session.\n"
@@ -294,17 +331,20 @@ def cascade_audit_node(state: WorkloadState) -> Dict[str, Any]:
                 f"Active Recovery Flags:\n" + "\n".join([f"- {f}" for f in flags])
             )
             
-            response = llm.invoke([
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ])
-            
-            # 3. Persist remediated plan back to PostgreSQL
-            db_adapter.update_session_remediation(
-                session_id=s_id,
-                status="REMEDIATED",
-                remediation_suggestion=response.content
-            )
+            try:
+                response = llm.invoke([
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ])
+                
+                # Persist remediated plan back to PostgreSQL
+                db_adapter.update_session_remediation(
+                    session_id=s_id,
+                    status="REMEDIATED",
+                    remediation_suggestion=response.content
+                )
+            except Exception as e:
+                logger.error(f"[Cascade Audit Node] Downstream remediation error for session {s_id}: {e}")
             
         log_agent_step(
             agent_name="WorldModelEngine",
@@ -314,8 +354,22 @@ def cascade_audit_node(state: WorkloadState) -> Dict[str, Any]:
                 "remediated_downstream_count": len(flagged_sessions)
             }
         )
+    else:
+        log_agent_step(
+            agent_name="WorldModelEngine",
+            action="downstream_cascade_remediation",
+            details={
+                "athlete_id": athlete_id,
+                "remediated_downstream_count": 0
+            }
+        )
 
-    return {"downstream_conflicts": flagged_sessions}
+    return {
+        "session_id": current_session_id or state.get("session_id"),
+        "status": "REJECTED_SAFETY_VIOLATION" if not candidate_approved else state.get("status"),
+        "remediation_suggestion": current_remediation or state.get("remediation_suggestion"),
+        "downstream_conflicts": flagged_sessions
+    }
 
 
 # =====================================================================

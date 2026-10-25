@@ -1,4 +1,3 @@
-# app/adapters/zetaris.py
 import os
 import logging
 from datetime import date, timedelta
@@ -20,10 +19,10 @@ if _ENV_PATH.exists():
         os.environ.setdefault(_key.strip(), _value.strip().strip('"').strip("'"))
 
 
-def get_db_connection():
+def get_db_connection(port_override: Optional[int] = None):
     """Returns a PostgreSQL/Zetaris connection with dictionary cursor support."""
     host = os.getenv("POSTGRES_HOST") or os.getenv("DB_HOST", "localhost")
-    port = int(os.getenv("POSTGRES_PORT") or os.getenv("DB_PORT", "5432"))
+    port = port_override or int(os.getenv("POSTGRES_PORT") or os.getenv("DB_PORT", "5432"))
     dbname = os.getenv("POSTGRES_DB") or os.getenv("DB_NAME", "postgres")
     user = os.getenv("POSTGRES_USER") or os.getenv("DB_USER", "postgres")
     password = os.getenv("POSTGRES_PASSWORD") or os.getenv("DB_PASSWORD", "postgres")
@@ -107,6 +106,36 @@ class ZetarisDBAdapter:
 
     def get_canonical_body_parts(self) -> List[Dict[str, Any]]:
         return fetch_canonical_body_parts()
+
+    def get_athlete_profile(self, athlete_id: str) -> Optional[Dict[str, Any]]:
+        """Fetches athlete capacity scalar, rpe_bias, and injury notes for adaptive calculations."""
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT athlete_id, name, experience_level, primary_goal,
+                           capacity_scalar, rpe_bias, injury_notes
+                    FROM athletes
+                    WHERE athlete_id = %s;
+                    """,
+                    (athlete_id,)
+                )
+                row = cur.fetchone()
+                if row:
+                    return dict(row)
+                # Fallback default profile if athlete row does not exist yet
+                return {
+                    "athlete_id": athlete_id,
+                    "name": athlete_id,
+                    "experience_level": "INTERMEDIATE",
+                    "primary_goal": "General Conditioning",
+                    "capacity_scalar": 1.0,
+                    "rpe_bias": 0.0,
+                    "injury_notes": ""
+                }
+        finally:
+            conn.close()
 
     def load_sessions(self, athlete_id: str) -> List[Dict[str, Any]]:
         """Loads all recorded sessions for an athlete ordered by session_date."""

@@ -1,4 +1,3 @@
-# app/graph.py
 import json
 import re
 import os
@@ -18,6 +17,7 @@ from app.tracing import log_agent_step, log_audit_verdict
 
 logger = logging.getLogger("loading_agent.graph")
 
+
 # =====================================================================
 # 1. State Definition
 # =====================================================================
@@ -26,6 +26,7 @@ class WorkloadState(TypedDict):
     session_date: date
     raw_input: str
     session_rpe: Optional[float]
+    temporal_tier: Optional[str]
     
     # Consensus Outputs
     session_title: Optional[str]
@@ -35,21 +36,22 @@ class WorkloadState(TypedDict):
     audit_approved: Optional[bool]
     audit_flags: Optional[List[Dict[str, Any]]]
     world_model_state: Optional[Dict[str, Any]]
+    acwr: Optional[float]
     
     # Remediation Loop
     remediation_suggestion: Optional[str]
     remediation_attempts: int
     evaluator_approved: Optional[bool]
+    remediated_loads: Optional[List[Dict[str, Any]]]
     
-    # Cascade Audit Outputs
+    # Cascade Audit & Persistence
+    session_id: Optional[str]
     downstream_conflicts: Optional[List[Dict[str, Any]]]
-    
-    # Final Outcome
     final_status: Optional[str]
 
 
 # =====================================================================
-# 2. Graph Node Functions with Tracing Telemetry
+# 2. Graph Node Functions
 # =====================================================================
 
 def consensus_node(state: WorkloadState) -> Dict[str, Any]:
@@ -63,7 +65,6 @@ def consensus_node(state: WorkloadState) -> Dict[str, Any]:
         session_rpe=state.get("session_rpe")
     )
     
-    # Trace step event
     log_agent_step(
         agent_name="ConsensusEngine",
         action="3_pass_extraction_completed",
@@ -96,8 +97,8 @@ def audit_node(state: WorkloadState) -> Dict[str, Any]:
     
     approved = simulation_result["simulation_approved"]
     violations = simulation_result["violations"]
+    computed_acwr = simulation_result.get("acwr", 1.0)
     
-    # Log structured step & audit verdict telemetry
     log_agent_step(
         agent_name="WorldModelEngine",
         action="state_delta_simulation",
@@ -108,57 +109,56 @@ def audit_node(state: WorkloadState) -> Dict[str, Any]:
         }
     )
     
-    # Log audit summary metric (defaulting ACWR baseline to 1.0 if not computed)
     log_audit_verdict(
         approved=approved,
         flags_count=len(violations),
-        acwr=simulation_result.get("acwr", 1.0)
+        acwr=computed_acwr
     )
     
     return {
         "audit_approved": approved,
         "audit_flags": violations,
-        "world_model_state": simulation_result["state_delta_summary"]
+        "world_model_state": simulation_result["state_delta_summary"],
+        "acwr": computed_acwr
     }
 
 
 def remediate_node(state: WorkloadState) -> Dict[str, Any]:
-    """Node 3: Proposes alternative workout plan resolving audit flags."""
-   
+    """Node 3: Formulates an optional advisory alternative plan."""
     athlete_id = state["athlete_id"]
     session_date = state["session_date"]
     audit_flags = state.get("audit_flags", [])
-    temporal_tier = state.get("temporal_tier", "FUTURE_OR_TODAY")
+    today = date.today()
+    is_historical = session_date < today
     attempt = state.get("remediation_attempts", 0) + 1
 
     llm = get_meterless_llm()
 
-    if temporal_tier == "RECENT_PAST":
+    if is_historical:
         system_prompt = (
-            "You are an expert Sports Physical Therapist & Recovery Specialist.\n"
-            "This workout ALREADY OCCURRED in the past 1 to 3 days. DO NOT suggest modifying or replacing the past workout.\n"
-            "Instead, generate a Targeted Recovery Protocol & Future Shielding Plan containing:\n"
-            "1. Localized Therapy Protocols (e.g., isometric holds for tendon relief, contrast showers, active mobility work).\n"
-            "2. Nutritional & Sleep Targets (protein pacing, anti-inflammatory guidelines).\n"
-            "3. Next-Session Shielding Warnings (specific guidance on what exercises/loads to reduce in the upcoming 48-72 hours).\n"
-            "Provide clear, practical, bulleted recommendations."
+            "You are an expert Sports Physical Therapist & Recovery Advisor.\n"
+            "This workout ALREADY OCCURRED and had high cumulative tissue strain.\n"
+            "Generate a supportive Recovery Guidance Plan for the athlete.\n\n"
+            "Format your output EXACTLY as follows (no markdown headers, no fluff):\n"
+            "Strain Notice: [1-line summary of historical strain logged]\n"
+            "Suggested Alternative: N/A - Workout completed (Focus on baseline recovery)\n"
+            "Recovery Tip: [Targeted recovery actions, hydration, sleep, or light mobility advice]"
         )
     else:
         system_prompt = (
-            "You are an expert Strength & Conditioning Biomechanics Agent.\n"
-            "The proposed future/today workout caused biomechanical tissue recovery or ACWR safety violations.\n"
-            "Generate an alternative, modified training session that:\n"
-            "1. Reduces mechanical stress on the flagged body parts.\n"
-            "2. Replaces high-impact movements with safer alternatives.\n"
-            "3. Keeps the overall training stimulus effective while lowering RPE/volume.\n"
-            "Format the output clearly as a structured workout session."
+            "You are a Strength & Conditioning Biomechanics Advisor.\n"
+            "An upcoming workout presents potential tissue strain or ACWR elevation.\n"
+            "Formulate an OPTIONAL alternative training suggestion that the athlete can choose to accept or disregard.\n\n"
+            "Format your output EXACTLY as follows (no markdown headers, no fluff):\n"
+            "Strain Notice: [1-line summary of risk]\n"
+            "Suggested Alternative: [Specific modified exercise or load drop option]\n"
+            "Recovery Tip: [Targeted recovery or light mobility suggestion]"
         )
 
     user_prompt = (
         f"Athlete: {athlete_id}\n"
         f"Session Date: {session_date}\n"
-        f"Temporal Tier: {temporal_tier}\n"
-        f"Flagged Safety Violations:\n" + "\n".join([f"- {v.get('message', v)}" for v in audit_flags])
+        f"Active Safety Flags:\n" + "\n".join([f"- {v.get('message', str(v))}" for v in audit_flags])
     )
 
     response = llm.invoke([
@@ -173,7 +173,10 @@ def remediate_node(state: WorkloadState) -> Dict[str, Any]:
 
 
 def evaluator_node(state: WorkloadState) -> Dict[str, Any]:
-    """Node 4: Evaluator Node validating candidate remediation plan."""
+    """
+    Node 4: Evaluates candidate remediation alternative.
+    Verifies alternative safety, but does NOT overwrite the submitted workout's risk status.
+    """
     logger.info("--- [LangGraph] Entering Evaluator Node ---")
     
     db_adapter = ZetarisDBAdapter()
@@ -217,36 +220,53 @@ def evaluator_node(state: WorkloadState) -> Dict[str, Any]:
                 "remediation_attempt": state.get("remediation_attempts", 1)
             }
         )
-        log_audit_verdict(
-            approved=is_approved,
-            flags_count=len(eval_simulation["violations"]),
-            acwr=eval_simulation.get("acwr", 1.0)
-        )
         
-        return {"evaluator_approved": is_approved}
+        return {
+            "evaluator_approved": is_approved,
+            "remediated_loads": candidate_loads if is_approved else []
+        }
         
     except Exception as e:
         logger.error(f"Evaluator parsing error: {e}")
         return {"evaluator_approved": False}
 
 
-def commit_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Persists evaluated session and tissue loads into Zetaris PostgreSQL."""
+def commit_node(state: WorkloadState) -> Dict[str, Any]:
+    """
+    Persists submitted workout to Zetaris DB.
+    Determines status based strictly on original submission flags:
+    - Clean -> APPROVED (Green)
+    - Past with flags -> HISTORICAL_WARNING (Yellow)
+    - Future/Today with flags -> PROPOSED_RISK_WARNING (Risk Badge)
+    """
+    logger.info("--- [LangGraph] Entering Commit Node ---")
     athlete_id = state["athlete_id"]
     session_date = state["session_date"]
     session_title = state.get("session_title", "Logged Workout")
     raw_input = state["raw_input"]
     session_rpe = state.get("session_rpe")
     consensus_loads = state.get("consensus_loads", [])
-    status = state.get("final_status", "APPROVED")
     acwr = state.get("acwr", 1.0)
     remediation_suggestion = state.get("remediation_suggestion")
+
+    is_historical = session_date < date.today()
+
+    # Determine status & title prefix based on original submission audit
+    if state.get("audit_approved"):
+        status = "APPROVED"
+        final_title = session_title
+    elif is_historical:
+        status = "HISTORICAL_WARNING"
+        final_title = f"[HIGH STRAIN] {session_title}"
+    else:
+        status = "PROPOSED_RISK_WARNING"
+        final_title = f"[RISK] {session_title}"
 
     db_adapter = ZetarisDBAdapter()
     session_id = db_adapter.save_approved_session(
         athlete_id=athlete_id,
         session_date=session_date,
-        session_title=session_title,
+        session_title=final_title,
         raw_text=raw_input,
         session_rpe=session_rpe,
         consensus_loads=consensus_loads,
@@ -255,53 +275,56 @@ def commit_node(state: Dict[str, Any]) -> Dict[str, Any]:
         remediation_suggestion=remediation_suggestion
     )
 
-    return {"session_id": session_id}
+    return {"session_id": session_id, "final_status": status}
 
 
 def cascade_audit_node(state: WorkloadState) -> Dict[str, Any]:
-    """Node 5: Persists terminal candidate rejection to DB and re-audits downstream sessions."""
+    """Node 5: Handles unapproved candidate persistence (after 3 failed retries) and audits downstream timeline."""
     logger.info("--- [LangGraph] Entering Cascade Audit Node ---")
     
     athlete_id = state["athlete_id"]
     session_date = state["session_date"]
+    today = date.today()
+    is_historical = session_date < today
     
     db_adapter = ZetarisDBAdapter()
     world_model = WorldModelEngine(db_adapter)
     
-    # 1. Handle primary candidate session rejection persistence
-    candidate_approved = state.get("simulation_approved", False)
     current_session_id = state.get("session_id")
-    current_status = state.get("status", "REJECTED_SAFETY_VIOLATION")
     current_remediation = state.get("remediation_suggestion") or ""
 
-    if not candidate_approved and not current_session_id:
-        if not current_remediation:
-            violations = state.get("violations", [])
-            flags_str = "\n".join([f"- {v.get('message', str(v))}" for v in violations]) or "- ACWR safety threshold breach"
-            current_remediation = (
-                f"🚨 SAFETY AUDIT REJECTION\n"
-                f"This workout was rejected after 3 remediation attempts due to high cumulative fatigue:\n"
-                f"{flags_str}\n\n"
-                f"Recommended Action: Complete rest or low-intensity active mobility."
-            )
+    # ONLY persist here if candidate was NOT saved by commit_node
+    if not current_session_id:
+        if is_historical:
+            status = "HISTORICAL_WARNING"
+            title = f"[HIGH STRAIN] {state.get('session_title', 'Workout')}"
+            if not current_remediation:
+                current_remediation = "⚠️ HIGH HISTORICAL STRAIN LOGGED\nWorkout exceeded standard fatigue limits."
+        else:
+            status = "PROPOSED_RISK_WARNING"
+            title = f"[RISK] {state.get('session_title', 'Workout')}"
+            if not current_remediation:
+                violations = state.get("audit_flags", [])
+                flags_str = "\n".join([f"- {v.get('message', str(v))}" for v in violations]) or "- Cumulative ACWR strain"
+                current_remediation = f"⚠️ ADVISORY LOAD WARNING\n{flags_str}\n\n💡 Consider complete rest or light recovery."
 
         try:
             current_session_id = db_adapter.save_approved_session(
                 athlete_id=athlete_id,
                 session_date=session_date,
-                session_title=f"[REJECTED] {state.get('session_title', 'Workout')}",
-                raw_text=state.get("raw_text", ""),
+                session_title=title,
+                raw_text=state.get("raw_input", ""),
                 session_rpe=state.get("session_rpe"),
                 consensus_loads=state.get("consensus_loads", []),
-                status="REJECTED_SAFETY_VIOLATION",
+                status=status,
                 acwr=float(state.get("acwr", 1.0)),
                 remediation_suggestion=current_remediation
             )
-            logger.info(f"[Cascade Audit Node] Saved candidate rejection record: {current_session_id}")
+            logger.info(f"[Cascade Audit Node] Persisted unapproved session ({status}): {current_session_id}")
         except Exception as e:
-            logger.error(f"[Cascade Audit Node] Error saving candidate rejection: {e}")
+            logger.error(f"[Cascade Audit Node] Error saving unapproved session: {e}")
 
-    # 2. World Model identifies downstream sessions in violation
+    # Re-audit downstream timeline
     flagged_sessions = []
     try:
         flagged_sessions = world_model.audit_downstream_timeline(athlete_id, session_date)
@@ -310,25 +333,27 @@ def cascade_audit_node(state: WorkloadState) -> Dict[str, Any]:
 
     if flagged_sessions:
         llm = get_meterless_llm()
-        
         for item in flagged_sessions:
             s_id = item["session_id"]
             s_date = item["session_date"]
             sim_res = item["sim_result"]
             flags = [v.get("message", str(v)) for v in sim_res.get("violations", [])]
             
-            # Synthesize remediation plan for downstream conflict
             system_prompt = (
-                "You are an expert Strength & Conditioning Biomechanics Agent.\n"
-                "A backfilled workout on a prior date has created a downstream tissue lockout conflict for this session.\n"
-                "Generate an alternative, modified training plan or targeted rest protocol that resolves these flags:"
+                "You are a Strength & Conditioning Biomechanics Advisor.\n"
+                "A backfilled prior workout has updated cumulative fatigue, creating potential tissue strain for this session.\n"
+                "Formulate an OPTIONAL alternative training suggestion that the athlete can choose to accept or disregard.\n\n"
+                "Format your output EXACTLY as follows (no markdown headers, no fluff):\n"
+                "Strain Notice: [1-line summary of risk]\n"
+                "Suggested Alternative: [Specific modified exercise or load drop option]\n"
+                "Recovery Tip: [Targeted recovery or light mobility suggestion]"
             )
             user_prompt = (
                 f"Athlete: {athlete_id}\n"
                 f"Session Date: {s_date}\n"
                 f"Title: {item.get('session_title')}\n"
-                f"Original Workout: {item.get('raw_input')}\n"
-                f"Active Recovery Flags:\n" + "\n".join([f"- {f}" for f in flags])
+                f"Original Input: {item.get('raw_input')}\n"
+                f"Active Flags:\n" + "\n".join([f"- {f}" for f in flags])
             )
             
             try:
@@ -336,37 +361,17 @@ def cascade_audit_node(state: WorkloadState) -> Dict[str, Any]:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ])
-                
-                # Persist remediated plan back to PostgreSQL
                 db_adapter.update_session_remediation(
                     session_id=s_id,
-                    status="REMEDIATED",
+                    status="PROPOSED_RISK_WARNING",
                     remediation_suggestion=response.content
                 )
             except Exception as e:
                 logger.error(f"[Cascade Audit Node] Downstream remediation error for session {s_id}: {e}")
-            
-        log_agent_step(
-            agent_name="WorldModelEngine",
-            action="downstream_cascade_remediation",
-            details={
-                "athlete_id": athlete_id,
-                "remediated_downstream_count": len(flagged_sessions)
-            }
-        )
-    else:
-        log_agent_step(
-            agent_name="WorldModelEngine",
-            action="downstream_cascade_remediation",
-            details={
-                "athlete_id": athlete_id,
-                "remediated_downstream_count": 0
-            }
-        )
 
     return {
         "session_id": current_session_id or state.get("session_id"),
-        "status": "REJECTED_SAFETY_VIOLATION" if not candidate_approved else state.get("status"),
+        "final_status": state.get("final_status") or ("PROPOSED_RISK_WARNING" if not state.get("audit_approved") else "APPROVED"),
         "remediation_suggestion": current_remediation or state.get("remediation_suggestion"),
         "downstream_conflicts": flagged_sessions
     }
@@ -383,11 +388,10 @@ def route_audit(state: WorkloadState) -> str:
 
 
 def route_remediation(state: WorkloadState) -> str:
-    if state.get("evaluator_approved"):
+    # Always route to commit so the submitted workout is saved with its RISK status
+    # and attached evaluated remediation plan.
+    if state.get("evaluator_approved") or state.get("remediation_attempts", 0) >= 3:
         return "commit"
-    if state.get("remediation_attempts", 0) >= 3:
-        logger.warning("Max remediation retry attempts reached (3). Route to cascade_audit.")
-        return "cascade_audit"
     return "remediate"
 
 
@@ -423,8 +427,7 @@ builder.add_conditional_edges(
     route_remediation,
     {
         "commit": "commit",
-        "remediate": "remediate",
-        "cascade_audit": "cascade_audit"
+        "remediate": "remediate"
     }
 )
 

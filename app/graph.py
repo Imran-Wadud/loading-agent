@@ -27,6 +27,7 @@ class WorkloadState(TypedDict):
     raw_input: str
     session_rpe: Optional[float]
     temporal_tier: Optional[str]
+    cache_hit: Optional[bool]
     
     # Consensus Outputs
     session_title: Optional[str]
@@ -53,6 +54,30 @@ class WorkloadState(TypedDict):
 # =====================================================================
 # 2. Graph Node Functions
 # =====================================================================
+
+def cache_check_node(state: WorkloadState):
+    """Checks the database for an exact string match of the workout input."""
+    raw_input = state.get("raw_input", "")
+    db = ZetarisDBAdapter()
+    
+    cached_data = db.get_cached_tissue_loads(raw_input)
+    
+    if cached_data and cached_data.get("loads"):
+        print(f"Cache Hit: Bypassing LLM Consensus for '{raw_input[:30]}...'")
+        return {
+            "consensus_loads": cached_data["loads"], 
+            "session_title": cached_data["session_title"],
+            "cache_hit": True
+        }
+    
+    print(f"Cache Miss: Routing to Consensus Engine for '{raw_input[:30]}...'")
+    return {"cache_hit": False}
+
+def route_after_cache(state: dict) -> str:
+    """Routes to world model if cache hit, otherwise to consensus extraction."""
+    if state.get("cache_hit"):
+        return "audit"
+    return "consensus"
 
 def consensus_node(state: WorkloadState) -> Dict[str, Any]:
     """Node 1: Executes 3-Pass Meterless Consensus Engine."""
@@ -401,6 +426,8 @@ def route_remediation(state: WorkloadState) -> str:
 
 builder = StateGraph(WorkloadState)
 
+# Add all nodes
+builder.add_node("cache_check", cache_check_node)
 builder.add_node("consensus", consensus_node)
 builder.add_node("audit", audit_node)
 builder.add_node("remediate", remediate_node)
@@ -408,7 +435,20 @@ builder.add_node("evaluator", evaluator_node)
 builder.add_node("commit", commit_node)
 builder.add_node("cascade_audit", cascade_audit_node)
 
-builder.set_entry_point("consensus")
+# Set the new entry point
+builder.set_entry_point("cache_check")
+
+# Route based on cache hit/miss
+builder.add_conditional_edges(
+    "cache_check",
+    route_after_cache,
+    {
+        "audit": "audit",
+        "consensus": "consensus"
+    }
+)
+
+# Standard flow continues
 builder.add_edge("consensus", "audit")
 
 builder.add_conditional_edges(

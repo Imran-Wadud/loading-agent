@@ -195,6 +195,52 @@ class ZetarisDBAdapter:
         finally:
             conn.close()
 
+    def get_cached_tissue_loads(self, raw_input: str) -> Optional[Dict[str, Any]]:
+        """Fetches previously approved tissue loads and title for an exact-match workout description."""
+        if not raw_input or not raw_input.strip():
+            return None
+            
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    WITH matched_session AS (
+                        SELECT session_id, session_title
+                        FROM athlete_sessions
+                        WHERE raw_input = %s
+                        ORDER BY session_date DESC
+                        LIMIT 1
+                    )
+                    SELECT ms.session_title, bp.body_part_id, bp.name, bp.tissue_type, tl.stress_score
+                    FROM matched_session ms
+                    JOIN tissue_loads_logged tl ON ms.session_id = tl.session_id
+                    JOIN body_parts bp ON tl.body_part_id = bp.body_part_id;
+                    """,
+                    (raw_input.strip(),)
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    return None
+                    
+                return {
+                    "session_title": rows[0]["session_title"],
+                    "loads": [
+                        {
+                            "body_part_id": r["body_part_id"],
+                            "name": r["name"],
+                            "tissue_type": r["tissue_type"],
+                            "stress_score": float(r["stress_score"])
+                        }
+                        for r in rows
+                    ]
+                }
+        except Exception as e:
+            print(f"[ZetarisDBAdapter] Cache lookup failed: {e}")
+            return None
+        finally:
+            conn.close()
+
     def get_session_tissue_loads(self, session_id: str) -> List[Dict[str, Any]]:
         """Loads all logged tissue loads mapped to a specific session_id."""
         conn = get_db_connection()

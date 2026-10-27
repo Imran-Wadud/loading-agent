@@ -461,24 +461,63 @@ class ZetarisDBAdapter:
                 session_id, status,
             )
 
+
     def fetch_historical_daily_loads(
-        self, athlete_id: str, target_date: date, days: int = 28
+        self,
+        athlete_id: str,
+        target_date: date,
+        days: int = 28,
+        exclude_session_id: Optional[str] = None,
     ) -> Dict[date, float]:
+        """
+        Fetch daily tissue-load totals over the historical window.
+
+        If exclude_session_id is supplied, exclude that session from the
+        totals. This is useful when simulating an already-persisted session
+        whose load will be added separately by the World Model engine.
+        """
         start_date = target_date - timedelta(days=days - 1)
-        rows = _execute_usl_query(
-            f"""
-            SELECT s.session_date, COALESCE(SUM(tl.stress_score), 0.0) AS daily_load
-            FROM {USL_PREFIX}.athlete_sessions s
-            JOIN {USL_PREFIX}.tissue_loads_logged tl
-              ON s.session_id = tl.session_id
+
+        params: List[Any] = [athlete_id, start_date, target_date]
+        exclude_clause = ""
+        if exclude_session_id:
+            exclude_clause = "AND s.session_id <> %s"
+            params.append(exclude_session_id)
+
+        query = f"""
+            SELECT
+                s.session_date,
+                SUM(tl.stress_score) AS daily_load
+            FROM {USL_PREFIX}.athlete_sessions AS s
+            JOIN {USL_PREFIX}.tissue_loads_logged AS tl
+                ON s.session_id = tl.session_id
             WHERE s.athlete_id = %s
-              AND s.session_date BETWEEN %s AND %s
+            AND s.session_date BETWEEN %s AND %s
+            {exclude_clause}
             GROUP BY s.session_date
-            """,
-            (athlete_id, start_date, target_date),
+            ORDER BY s.session_date
+        """
+
+        rows = _execute_usl_query(
+            query,
+            tuple(params),
             columns=["session_date", "daily_load"],
         )
-        return {row["session_date"]: float(row["daily_load"]) for row in rows}
+
+        history: Dict[date, float] = {}
+        for row in rows:
+            raw_date = row["session_date"]
+            if isinstance(raw_date, datetime):
+                day = raw_date.date()
+            elif isinstance(raw_date, date):
+                day = raw_date
+            else:
+                day = date.fromisoformat(str(raw_date)[:10])
+            history[day] = history.get(day, 0.0) + float(row["daily_load"] or 0.0)
+
+        return history
+
+
 
     def get_active_recovery_window(
         self, athlete_id: str, session_date: date
@@ -502,6 +541,157 @@ class ZetarisDBAdapter:
                 "body_part_id", "name", "tissue_type", "stress_score",
             ],
         )
+
+
+    def get_unified_training_context(
+        self,
+        athlete_id: str,
+        scheduled_date: date,
+    ) -> List[Dict[str, Any]]:
+        """Read the plan, latest World Model assessment, and session history via USL."""
+
+        columns = [
+            "plan_id",
+            "athlete_id",
+            "scheduled_date",
+            "session_title",
+            "exercise",
+            "sets",
+            "reps",
+            "planned_load_kg",
+            "target_rpe",
+            "priority",
+            "source_note",
+            "prior_session_id",
+            "prior_session_date",
+            "prior_session_title",
+            "prior_session_status",
+            "prior_session_acwr",
+            "world_model_observation_id",
+            "world_model_observed_at",
+            "world_model_simulation_approved",
+            "world_model_acwr",
+            "world_model_violations",
+        ]
+
+        query = f"""
+            WITH planned AS (
+                SELECT
+                    plan_id,
+                    athlete_id,
+                    scheduled_date,
+                    session_title,
+                    exercise,
+                    sets,
+                    reps,
+                    planned_load_kg,
+                    target_rpe,
+                    priority,
+                    source_note
+                FROM {USL_PREFIX}.loading_agent_training_plan_sample
+                WHERE athlete_id = %s
+                AND scheduled_date = %s
+            ),
+            previous_sessions AS (
+                SELECT
+                    session_id,
+                    session_date,
+                    session_title,
+                    status,
+                    acwr,
+                    ROW_NUMBER() OVER (
+                        ORDER BY session_date DESC, session_id DESC
+                    ) AS rn
+                FROM {USL_PREFIX}.athlete_sessions
+                WHERE athlete_id = %s
+                AND session_date <= %s
+            ),
+            ranked_assessments AS (
+                SELECT
+                    external_id,
+                    observed_at,
+                    last_event_seq,
+                    get_json_object(payload_json, '$.athlete_id') AS wm_athlete_id,
+                    get_json_object(payload_json, '$.session_date') AS wm_session_date,
+                    get_json_object(
+                        payload_json,
+                        '$.assessment.simulation_approved'
+                    ) AS simulation_approved,
+                    get_json_object(
+                        payload_json,
+                        '$.assessment.acwr'
+                    ) AS world_model_acwr,
+                    get_json_object(
+                        payload_json,
+                        '$.assessment.violations'
+                    ) AS world_model_violations,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY
+                            get_json_object(payload_json, '$.athlete_id'),
+                            get_json_object(payload_json, '$.session_date')
+                        ORDER BY observed_at DESC, last_event_seq DESC
+                    ) AS rn
+                FROM {USL_PREFIX}.wm_observations
+                WHERE namespace = 'loading-agent'
+            )
+            SELECT
+                p.plan_id,
+                p.athlete_id,
+                p.scheduled_date,
+                p.session_title,
+                p.exercise,
+                p.sets,
+                p.reps,
+                p.planned_load_kg,
+                p.target_rpe,
+                p.priority,
+                p.source_note,
+                s.session_id AS prior_session_id,
+                s.session_date AS prior_session_date,
+                s.session_title AS prior_session_title,
+                s.status AS prior_session_status,
+                s.acwr AS prior_session_acwr,
+                a.external_id AS world_model_observation_id,
+                a.observed_at AS world_model_observed_at,
+                a.simulation_approved AS world_model_simulation_approved,
+                a.world_model_acwr,
+                a.world_model_violations
+            FROM planned p
+            LEFT JOIN previous_sessions s
+                ON s.rn = 1
+            LEFT JOIN ranked_assessments a
+                ON a.wm_athlete_id = p.athlete_id
+            AND a.wm_session_date = CAST(p.scheduled_date AS STRING)
+            AND a.rn = 1
+            ORDER BY p.plan_id
+        """
+
+        rows = _execute_usl_query(
+            query,
+            (
+                athlete_id,
+                scheduled_date,
+                athlete_id,
+                scheduled_date,
+            ),
+            columns=columns,
+        )
+
+        matched_assessments = sum(
+            1 for row in rows if row.get("world_model_observation_id")
+        )
+
+        logger.info(
+            "Zetaris USL unified read: athlete=%s date=%s plan_rows=%d "
+            "matched_world_model_assessments=%d",
+            athlete_id,
+            scheduled_date,
+            len(rows),
+            matched_assessments,
+        )
+
+        return rows
+
 
     def swap_remediated_workout(
         self,

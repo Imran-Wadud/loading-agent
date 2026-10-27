@@ -1,7 +1,10 @@
 # app/engines/world_model.py
 import logging
+import math
 from typing import Dict, Any, List, Optional
 from datetime import date, timedelta
+from app.adapters.meterless_world_model import persist_workload_assessment
+
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +125,11 @@ class WorldModelEngine:
         session_date: date,
         extracted_loads: List[Dict[str, Any]],
         session_rpe: float = 8.0,
-        today: Optional[date] = None
+        exclude_session_id=None,
+        today: Optional[date] = None,
+        athlete_name: Optional[str] = None,
+        session_id: Optional[str] = None,
+        session_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Simulates state deltas, categorizing the request into 3 temporal tiers:
@@ -268,7 +275,7 @@ class WorldModelEngine:
 
         simulation_approved = not any(v.get("severity") == "CRITICAL" for v in violations)
         
-        return {
+        result = {
             "simulation_approved": simulation_approved,
             "temporal_tier": temporal_tier,
             "acwr": acwr,
@@ -283,6 +290,36 @@ class WorldModelEngine:
                 "session_date": str(session_date),
                 "temporal_tier": temporal_tier,
                 "acwr": acwr,
-                "simulation_status": "APPROVED" if simulation_approved else "NEEDS_REMEDIATION"
-            }
+                "simulation_status": (
+                    "APPROVED" if simulation_approved
+                    else "NEEDS_REMEDIATION"
+                ),
+            },
         }
+
+        # Persist the completed result through the Meterless World Model.
+        # This does not recalculate or override the workload decision.
+        wm_result = persist_workload_assessment(
+            athlete_id=str(athlete_id),
+            athlete_name=str(athlete_name or athlete_id),
+            session_id=str(
+                session_id or f"{athlete_id}:{session_date.isoformat()}"
+            ),
+            session_name=str(
+                session_name or f"Training session {session_date.isoformat()}"
+            ),
+            session_date=session_date.isoformat(),
+            assessment={
+                "simulation_approved": result["simulation_approved"],
+                "temporal_tier": result["temporal_tier"],
+                "acwr": result["acwr"],
+                "acute_load_7d": result["acute_load_7d"],
+                "chronic_load_28d": result["chronic_load_28d"],
+                "entities_tracked": result["entities_tracked"],
+                "violations": result["violations"],
+                "state_delta_summary": result["state_delta_summary"],
+            },
+        )
+
+        result["meterless_world_model"] = wm_result
+        return result

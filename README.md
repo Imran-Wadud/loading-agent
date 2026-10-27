@@ -1,119 +1,172 @@
 # Loading Agent — Athletic Workload & Recovery Engine
 
-Loading Agent turns a natural-language workout description into a structured tissue-load proposal, evaluates the proposed workload against an athlete's recent training history, and records the result with an approval or risk-warning status. When a session raises a safety flag, the agent generates an optional alternative and checks the proposed alternative against the World Model before committing the original session and its advisory status.
+**Hackathon track:** Reasoning Architecture  
+**Interface:** Reflex dashboard + interactive CLI  
+**Core stack:** Python, LangGraph, PostgreSQL, Zetaris USL, Meterless Nightshift, Meterless World Model, NVIDIA Nemotron
 
-This is a hackathon prototype for workload analysis and demonstration. Its scores and recommendations are heuristic and model-assisted; they are **not medical advice, a diagnosis, or a substitute for a qualified coach or clinician**.
+Loading Agent helps athletes and coaches evaluate a proposed training session against recorded workload and recovery context. It converts a workout description into a structured tissue-load proposal, simulates the candidate workload, records risk flags and can send a suggested alternative back through an evaluator and another simulation.
+
+> **Prototype and safety notice:** Loading Agent uses heuristic and model-assisted workload estimates. ACWR and tissue-stress checks are not clinically validated injury predictions or medical advice. Outputs should be reviewed by a qualified coach or clinician.
+
+## Contents
+
+- [What it does](#what-it-does)
+- [Architecture](#architecture)
+- [Repository layout](#repository-layout)
+- [Prerequisites](#prerequisites)
+- [Setup on Windows](#setup-on-windows)
+- [Configure Zetaris](#configure-zetaris)
+- [Run the application](#run-the-application)
+- [Verify the end-to-end integration](#verify-the-end-to-end-integration)
+- [Troubleshooting](#troubleshooting)
+- [Demo video script](#demo-video-script)
+- [Limitations and next steps](#limitations-and-next-steps)
+- [Sponsor technology](#sponsor-technology)
 
 ## What it does
 
-- Accepts a workout description, athlete ID, session date, and session RPE.
-- Uses a three-pass Meterless Consensus flow to extract candidate tissue loads and canonical body-part IDs.
-- Runs a World Model simulation using recent workload, tissue recovery windows, and a 7-day acute / 28-day chronic workload ratio (ACWR).
-- Flags risk conditions such as an ACWR spike and assigns temporal handling for future/today, recent-past, and distant-past sessions.
-- Generates an optional three-line remediation advisory and sends its candidate tissue loads through the evaluator for another World Model simulation, with a bounded retry loop.
-- Stores sessions and tissue loads in PostgreSQL and emits structured agent/audit events to the console.
-- Persists workload assessments through the Meterless World Model HTTP service and reads the resulting observation back through Zetaris USL.
-- Queries a unified context from three registered sources: the training-plan reference CSV, prior athlete sessions, and the matching World Model observation.
+1. **Extracts a workout.** A three-pass consensus flow turns natural-language input into a candidate tissue-load profile with canonical body-part identifiers.
+2. **Simulates workload.** The Python World Model evaluates the candidate using the available athlete history, 7-day acute and 28-day chronic workload, ACWR and tissue-recovery rules.
+3. **Audits and traces the outcome.** The graph records an audit verdict, risk flags and structured events such as `TRACE_EVENT` and `AUDIT_SUMMARY`.
+4. **Checks an alternative.** When a proposal is flagged, a remediation step may suggest a lower-load alternative. The candidate must be parsed and evaluated separately; a model suggestion is not automatically considered safe. The retry loop is bounded.
+5. **Persists and retrieves evidence.** The Python engine sends a completed workload assessment to the separate Meterless World Model HTTP service. Its persisted observation can be exposed through Zetaris USL and queried alongside the plan and previous-session history.
 
-## Architecture and workflow
+A session outcome depends on stored athlete history, selected session date, the current code/configuration and model output. Repeating a workout after storing new sessions can change the context and result.
+
+## Architecture
 
 ```text
-Workout input (dashboard or CLI)
-            |
-            v
-   LangGraph workload graph
-            |
-      Cache lookup
-        /      \
-     hit        miss
-      |           |
-      |     3-pass Consensus (Nightshift/model adapter)
-      |           |
-      +-----------+
-            |
-            v
-     World Model simulation
-       |             |
-    approved       flagged
-       |             |
-       |       remediation suggestion
-       |             |
-       |       Evaluator parses candidate tissue loads
-       |             |
-       |       World Model re-validation (bounded retries)
-       +-------------+
-            |
-            v
-   Commit original session and status
-            |
-            v
-   Cascade audit of downstream sessions
+User: workout description, athlete, date, RPE
+                 |
+                 v
+       Reflex dashboard / CLI
+                 |
+                 v
+        Python + LangGraph
+                 |
+        Three-pass consensus
+                 |
+                 v
+       Python World Model
+       - recent workload / ACWR
+       - recovery windows
+       - safety flags
+          |             |
+      no risk         risk flag
+          |             |
+          |       remediation suggestion
+          |             |
+          |       evaluator + re-simulation
+          |        (bounded retries)
+          +-------------+
+                 |
+                 v
+        Commit status + trace
+                 |
+                 +------> Python adapter --HTTP--> Meterless World Model
+                 |                                  (TypeScript service)
+                 |                                          |
+                 |                                          v
+                 |                                      PostgreSQL
+                 |
+                 +------> Zetaris REST SQL / USL <--- registered sources
+                           |      |      |
+                           |      |      +-- World Model observations
+                           |      +--------- prior athlete sessions
+                           +---------------- training-plan reference rows
+                 |
+                 v
+        Unified audit context / logs
 ```
 
-The evaluator does not silently turn an unsafe original submission into an approved workout. The submitted session's status follows the original audit; a remediation is an optional alternative and must separately pass validation.
+The TypeScript service is **a separate process**. It persists assessment observations through the Meterless World Model implementation; it does not replace `app/engines/world_model.py`, which still computes the workload assessment and its approval/risk outcome.
 
-### Main components
+### Key components
 
-| Component | Responsibility |
+| Path | Role |
 |---|---|
-| `app/graph.py` | LangGraph state, orchestration, bounded remediation/evaluator loop, commit and cascade audit. |
-| `app/engines/consensus.py` | Three-pass extraction and aggregation of candidate tissue loads. |
-| `app/engines/world_model.py` | Workload simulation, temporal tiers, ACWR and tissue-load safety flags. |
-| `app/adapters/zetaris.py` | Read-only data access through the Zetaris REST SQL endpoint and registered USL tables; PostgreSQL writes for application-owned session records. |
-| `app/adapters/meterless.py` | OpenAI-compatible client for Meterless Nightshift, with configurable model/provider preference and fallback. |
-| `app/adapters/meterless_world_model.py` | HTTP bridge that posts completed workload assessments to the Meterless World Model service. |
-| `app/tracing.py` | Structured `TRACE_EVENT` and `AUDIT_SUMMARY` logging. |
-| `app/ui/dashboard.py` | Reflex dashboard entry point. |
-| `cli.py` | Interactive terminal entry point for running the workload graph without the dashboard. |
+| `run.py` | Launches the Reflex app using the project's Reflex configuration. |
+| `rxconfig.py`, `app/app.py` | Reflex configuration and app entry point. |
+| `app/graph.py` | LangGraph state, orchestration, audit flow, remediation/evaluator loop and commit/cascade operations. |
+| `app/engines/consensus.py` | Multi-pass workout-to-tissue-load extraction. |
+| `app/engines/world_model.py` | Workload calculation, ACWR, tissue recovery and risk flags. |
+| `app/adapters/meterless.py` | OpenAI-compatible client for Meterless Nightshift and the configured model/provider preference. |
+| `app/adapters/meterless_world_model.py` | HTTP client for persisting a completed assessment to the separate TypeScript service. |
+| `app/adapters/zetaris.py` | PostgreSQL access for app-owned records and read queries through Zetaris REST SQL/USL. |
+| `services/meterless-world-model/server.ts` | HTTP server exposing `/health` and `POST /assessments`. |
+| `services/meterless-world-model/index.ts` | Meterless World Model implementation used by the service. |
+| `services/meterless-world-model/schema_postgres.sql` | PostgreSQL schema for World Model persistence (if this is the path in your current checkout). |
+| `data/schema.sql` | Application tables and initial schema. **This schema contains `DROP TABLE IF EXISTS` statements: use it only when setting up a fresh/empty app database.** |
+| `scripts/seed_db.py` | Applies `data/schema.sql` and seeds the default athlete/body-part dictionary. This also runs the destructive schema statements; do not run it against a database containing data you need to keep. |
 
-## Sponsor technology
+## Repository layout
 
-### Zetaris
+The main app and the Meterless service have separate runtimes and configuration files. The relevant structure should resemble:
 
-Zetaris is the query layer for the registered application, World Model and training-plan sources. Application reads use the USL namespace configured in `app/adapters/zetaris.py`:
+```text
+loading-agent/
+├── app/
+│   ├── adapters/
+│   │   ├── meterless.py
+│   │   ├── meterless_world_model.py
+│   │   └── zetaris.py
+│   ├── engines/
+│   │   ├── consensus.py
+│   │   └── world_model.py
+│   ├── graph.py
+│   └── ui/
+│       └── dashboard.py
+├── data/
+│   └── schema.sql
+├── services/
+│   └── meterless-world-model/
+│       ├── server.ts
+│       ├── index.ts
+│       ├── package.json
+│       ├── package-lock.json
+│       ├── schema_postgres.sql
+│       └── .env.example
+├── .env.example
+├── .gitignore
+├── requirements.txt
+├── rxconfig.py
+├── run.py
+└── README.md
+```
 
-`lightning.metastore.loading_agent.loading_agent_usl`
+If a filename is different in your committed checkout, use the actual path shown by `git status`/Explorer. Commit the service source, `package.json`, `package-lock.json`, schema and environment **examples**, but not real `.env` files or `node_modules`.
 
-The unified training-context query joins:
+## Prerequisites
 
-- `loading_agent_training_plan_sample` — the reference training-plan rows registered from the Zetaris FileStore source;
-- `athlete_sessions` — prior sessions for the athlete;
-- `wm_observations` — persisted Meterless World Model assessments, matched by athlete and session date.
+For the documented Windows/PowerShell workflow:
 
-The graph logs this result as `USL_UNIFIED_CONTEXT`. A successful live run on 27 October 2026 returned one plan row and matched one World Model observation for `athlete_001` on `2026-10-30`. The six-row reference-plan quality check also returned six valid and zero invalid records in the configured Zetaris environment.
+- **Python 3.11** (recommended for the pinned requirements).
+- **Node.js 22 or newer** and npm for the TypeScript World Model service.
+- A running PostgreSQL server reachable from the host. Your app and the World Model use separate databases; they can live on one PostgreSQL server.
+- A Zetaris environment with REST SQL access, the expected source connections, and the `loading_agent_usl` USL namespace registered/activated.
+- A Meterless Nightshift runtime URL and runtime token, with the intended model provider configured in Nightshift.
+- Git to clone the repository.
 
-### Meterless World Model
+A fresh clone does **not** automatically include your local database contents, Zetaris source registrations/activation, Nightshift provider credentials, or any data registered outside Git. Those items must be available/configured separately on the other machine.
 
-After `WorldModelEngine.simulate_state_delta()` evaluates a workload, the Python adapter posts the assessment to the Meterless World Model service at `/assessments`. That service owns the World Model persistence path and stores observations/entities/events in its PostgreSQL database. Those records are then exposed as registered Zetaris USL tables so the workload graph can retrieve them as part of the unified context.
+## Setup on Windows
 
-The service's default local URL is `http://127.0.0.1:8090`; its health endpoint is `/health`. The service currently lives in a separate Meterless World Model project directory rather than being launched by the Loading Agent process itself.
+### 1. Clone the repository
 
-### Meterless Nightshift and NVIDIA Nemotron
+Open PowerShell in the directory where you keep development projects:
 
-The application uses an OpenAI-compatible client pointed at Meterless Nightshift. The configured Nemotron model is controlled by `NEMOTRON_MODEL` (the current example value is `nvidia/nemotron-3.5-lightning-30b-a3b`). With `USE_GEMINI_PRIMARY=false`, the adapter prefers the Nightshift/Nemotron client and can fall back to Gemini if a Gemini API key is configured. With `USE_GEMINI_PRIMARY=true` and a Gemini key present, Gemini is preferred for development/testing and Nightshift becomes the fallback.
+```powershell
+git clone <YOUR_PUBLIC_GITHUB_URL>
+cd loading-agent
+```
 
-The exact provider/model that handled a particular request depends on this configuration and fallback behavior. For a submission claiming that a particular request used Nemotron, keep evidence from the corresponding Nightshift/model logs rather than relying solely on the configured default.
+Replace the URL and folder name with the actual public repository values.
 
-## Requirements
-
-- Python 3.11 recommended for the pinned Python dependencies.
-- PostgreSQL for the application's session/tissue-load data.
-- A running Zetaris instance with the required sources registered and the `loading_agent_usl` namespace activated.
-- Meterless Nightshift running and configured with the provider/model you intend to use.
-- The Meterless World Model TypeScript service and its PostgreSQL database, for persistent assessment observations.
-- Node.js/npm for the separate TypeScript World Model service.
-
-The app itself is currently run directly from a Python environment. The current repository's complete Docker build and a network-independent `SAMPLE_MODE=true` path have not been verified; do not assume either works until tested.
-
-## Setup
-
-### 1. Clone and install Python dependencies
+### 2. Create the Python environment
 
 From the repository root:
 
 ```powershell
-git clone <your-public-repository-url>
-cd loading-agent
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
@@ -121,141 +174,262 @@ python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-On macOS/Linux, create and activate the virtual environment with `python3 -m venv .venv` and `source .venv/bin/activate` instead.
+If PowerShell blocks activation, use the activation instructions appropriate for your machine or run the virtual environment's Python directly. Do not change machine-wide execution policy just for this project unless you understand the implications.
 
-### 2. Configure environment variables
+Open the root `.env` in a local editor and fill in the actual values. Do not commit or share this file.
 
-Edit `.env` locally. Never commit it. Use real values only in your local environment.
+#### Root `.env` settings
 
-| Variable | Purpose |
+| Variable | Purpose / what to check |
 |---|---|
-| `ZETARIS_REST_URL` | Zetaris REST SQL base URL; local default is `http://localhost:8888/api/v1.0`. |
-| `ZETARIS_ORG_ID` | Zetaris organisation ID. |
-| `ZETARIS_API_KEY` | Zetaris API credential. |
-| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | PostgreSQL connection for application-owned data. The adapter also supports `POSTGRES_USER` and `POSTGRES_PASSWORD` as fallbacks for the username/password. |
-| `METERLESS_BASE_URL` | Nightshift OpenAI-compatible endpoint; local default is `http://127.0.0.1:8088/v1`. |
-| `METERLESS_RUNTIME_TOKEN` | Runtime token issued by Meterless Nightshift. |
-| `NEMOTRON_MODEL` | Model ID to request through Nightshift. |
-| `USE_GEMINI_PRIMARY` | Set to `false` to prefer Nightshift/Nemotron; set to `true` to prefer Gemini when a Gemini API key is configured. |
-| `GEMINI_API_KEY`, `GEMINI_MODEL` | Optional Gemini fallback/development provider settings. |
-| `METERLESS_WORLD_MODEL_URL` | World Model service base URL; defaults to `http://127.0.0.1:8090`. |
-| `METERLESS_WORLD_MODEL_ENABLED` | Enables/disables persistence through the World Model bridge; defaults to enabled. |
-| `METERLESS_WORLD_MODEL_TIMEOUT_SECONDS` | HTTP bridge timeout; defaults to `2.5`. |
-| `METERLESS_WORLD_MODEL_REQUIRED` | If `true`, a failed World Model persistence request raises an error; defaults to `false` during development. |
+| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | PostgreSQL connection for Loading Agent application-owned tables. `DB_NAME` must be the database where `data/schema.sql` was applied. Use your currently working value rather than assuming the database is named `postgres`. |
+| `ZETARIS_REST_URL` | Base URL for Zetaris REST SQL, commonly `http://localhost:8888/api/v1.0` in the existing local setup. Use the real reachable endpoint. |
+| `ZETARIS_ORG_ID`, `ZETARIS_API_KEY` | Zetaris org ID and REST API credentials. Never paste the API key into the README, issues or screenshots. |
+| `METERLESS_BASE_URL` | Meterless Nightshift OpenAI-compatible endpoint, commonly `http://127.0.0.1:8088/v1` for the local setup. |
+| `METERLESS_RUNTIME_TOKEN` | Runtime token issued by Nightshift; this is not the NVIDIA provider API key. |
+| `NEMOTRON_MODEL` | Model ID requested by the app through Nightshift; current example: `nvidia/nemotron-3.5-lightning-30b-a3b`. Verify the resolved model in Nightshift/run evidence if claiming a specific request used it. |
+| `USE_GEMINI_PRIMARY` | Set to `false` to prefer Nightshift/Nemotron for this build. Set to `true` only when intentionally preferring the direct Gemini provider and a Gemini key is configured. |
+| `GEMINI_API_KEY`, `GEMINI_MODEL` | Optional direct Gemini fallback/dev settings. Keep the key blank if not used. |
+| `METERLESS_WORLD_MODEL_ENABLED` | Enables/disables the Python-to-World-Model persistence request. |
+| `METERLESS_WORLD_MODEL_URL` | HTTP service URL, normally `http://127.0.0.1:8090` when both processes run on the same host. |
+| `METERLESS_WORLD_MODEL_TIMEOUT_SECONDS` | HTTP request timeout. |
+| `METERLESS_WORLD_MODEL_REQUIRED` | When true, a failed persistence request should fail the workflow rather than silently passing. Keep true for end-to-end verification. |
 
-The NVIDIA API key belongs in the Meterless Nightshift provider configuration, **not** in Loading Agent's `.env` file.
+For this build, the NVIDIA provider credential belongs in **Meterless Nightshift's provider settings**, not in the repository or the app's `.env`. Leave placeholders in `.env.example` only.
 
-### 3. Set up the databases
+### 3. Configure the application PostgreSQL database
 
-Create the application database and apply its schema using the repository's schema file. For example, with PostgreSQL command-line tools:
+Use the existing app database if it already contains the required tables and data. On a fresh machine, first create an empty app database and set root `.env` `DB_NAME`/credentials to match it.
+
+If you use the helper, understand the warning first:
 
 ```powershell
-createdb -U <postgres-user> loading_agent_db
-psql -U <postgres-user> -d loading_agent_db -v ON_ERROR_STOP=1 -f .\data\schema.sql
+python scripts/seed_db.py
 ```
 
-Create the separate database used by the Meterless World Model service and apply its schema:
+`seed_db.py` applies `data/schema.sql`, and that schema includes `DROP TABLE IF EXISTS` for the application tables before recreating them. **Only run this against a fresh/empty application database or after backing up data and deliberately intending to reset those tables. Never run it as a routine startup command on the working database.**
+
+If your database already has application data, do not run the seed script; point the app at that database and preserve its contents.
+
+### 4. Configure the Meterless World Model service
+
+The TypeScript server must be running before an end-to-end assessment can be persisted. It is a separate process from the Reflex UI.
+
+Open a **second PowerShell terminal** at the service directory:
 
 ```powershell
-createdb -U <postgres-user> loading_agent_world_model
-psql -U <postgres-user> -d loading_agent_world_model -v ON_ERROR_STOP=1 -f .\data\schema_postgres.sql
+cd services\meterless-world-model
+Copy-Item .env.example .env
 ```
 
-Adjust credentials, host and port for your PostgreSQL setup. The World Model service's own `.env` must point its `DATABASE_URL` (or supported World Model database settings) to `loading_agent_world_model`. Do not point the service at the application database.
+Configure the service `.env` to connect to its **own** PostgreSQL database, `loading_agent_world_model` in the example setup. The inspected `index.ts` reads `WORLD_MODEL_DATABASE_URL`, or the `WORLD_MODEL_PG*` / `POSTGRES_*` host, port, user, password and database variables. It does **not** read a generic `DATABASE_URL` by itself.
 
-### 4. Configure Zetaris
+Recommended connection-string form:
 
-Register the appropriate PostgreSQL sources in Zetaris and expose the tables via USL in the namespace above. The working setup uses these logical sources:
+```dotenv
+WORLD_MODEL_DATABASE_URL=postgresql://zetaris:URL_ENCODED_PASSWORD@127.0.0.1:5432/loading_agent_world_model
+METERLESS_WM_HOST=127.0.0.1
+METERLESS_WM_PORT=8090
+WORLD_MODEL_NAMESPACE=loading-agent
+```
 
-| Source | Main tables/purpose |
-|---|---|
-| `loading_agent_db` | `athletes`, `body_parts`, `tissue_kinetics`, `athlete_sessions`, `tissue_loads_logged`. |
-| `loading_agent_world_model` | Meterless World Model tables such as `wm_entities`, `wm_events`, `wm_observations`, `wm_relationships`, `wm_pipeline_checkpoints` and `wm_schema_migrations`. |
-| `loading_agent_files` | `loading_agent_training_plan_sample`, registered from the reference CSV in Zetaris FileStore. |
+Use URL-encoded credentials if the password contains characters such as `@`, `:`, `/`, `#` or `%`. Alternatively, use these individual connection settings instead of the connection string:
 
-Activate the USL definition after registering/updating source tables. The corresponding source data and credentials are environment-specific and are not bundled as credentials in this repository.
+```dotenv
+WORLD_MODEL_PGHOST=127.0.0.1
+WORLD_MODEL_PGPORT=5432
+WORLD_MODEL_PGUSER=zetaris
+WORLD_MODEL_PGPASSWORD=replace-with-your-postgres-password
+WORLD_MODEL_PGDATABASE=loading_agent_world_model
+```
 
-### 5. Start Meterless World Model
+Do not commit the real credentials. The service's database is distinct from the database selected by the root `.env` `DB_NAME`.
 
-In the separate Meterless World Model TypeScript project directory, configure its `.env` with the PostgreSQL connection described above, install its npm dependencies if not already installed, and start the HTTP service:
+#### Create the World Model database/schema (fresh setup only)
+
+If the database does not already exist, create it with a user allowed to create databases:
 
 ```powershell
-npm install
+createdb -h 127.0.0.1 -p 5432 -U zetaris loading_agent_world_model
+```
+
+Apply the World Model schema from the service directory, adjusting the path if your committed tree differs:
+
+```powershell
+psql -h 127.0.0.1 -p 5432 -U zetaris -d loading_agent_world_model -v ON_ERROR_STOP=1 -f .\schema_postgres.sql
+```
+
+Skip these initialization commands if that database/schema already exists. Do not drop or recreate a populated World Model database just to set up another machine; arrange a backup/restore or a fresh database as appropriate.
+
+If PostgreSQL is running in Docker but the TypeScript server runs on Windows, confirm the PostgreSQL port is published to the host. For your local container name, a check such as this can help:
+
+```powershell
+docker port zetaris-postgres-1 5432
+```
+
+If that prints no mapping, a host-side Node process cannot reach the container through `127.0.0.1:5432`. Use the actual published port or run the process in the same Docker network; do not guess a container's host port.
+
+#### Install and start the Node service
+
+Still inside `services\meterless-world-model`:
+
+```powershell
+npm ci
 npm run serve
 ```
 
-Check that `http://127.0.0.1:8090/health` returns an `ok` response and identifies PostgreSQL storage. Keep this service running while exercising the live workload flow if assessment persistence is enabled.
+`npm ci` uses the committed `package-lock.json`. If the current service `package.json` does not define a `serve` script, ensure the intended script is present (for example `"serve": "node --env-file=.env --import tsx server.ts"`) and commit the updated `package.json` and lockfile. Leave this terminal running.
 
-## Run the application
-
-### Dashboard
-
-With the virtual environment active and all required live services running, start the Reflex dashboard from the repository root:
+Check its health endpoint from another terminal:
 
 ```powershell
-reflex run
+Invoke-RestMethod http://127.0.0.1:8090/health
 ```
 
-### Interactive CLI
+A healthy response should contain `ok: true`, `engine: "meterless-world-model"`, `storage: "postgres"` and the namespace. The server also exposes `POST /assessments`, called by the Python adapter during a workload run.
 
-Alternatively, run the agent from the terminal:
+### 5. Configure Zetaris USL
+
+The application queries Zetaris REST SQL with the USL namespace:
+
+```text
+lightning.metastore.loading_agent.loading_agent_usl
+```
+
+Make sure Zetaris can access and expose the registered sources used by the unified-context query:
+
+| Logical source | Data used by Loading Agent |
+|---|---|
+| `loading_agent_db` | Application tables such as `athletes`, `body_parts`, `tissue_kinetics`, `athlete_sessions`, and `tissue_loads_logged`. |
+| `loading_agent_world_model` | Meterless World Model persistence tables, including `wm_entities`, `wm_events`, `wm_observations`, `wm_relationships`, and checkpoints/migrations. |
+| `loading_agent_files` | Reference training-plan data exposed as `loading_agent_training_plan_sample` through Zetaris FileStore. |
+
+The USL model/SQL assets in the repository are configuration examples for your environment; credentials and activation state are not supplied by Git. Register the correct source connections and activate/update the USL objects in your Zetaris workspace.
+
+**Important:** `USL_UNIFIED_CONTEXT: []` means the unified query returned no rows. It does not, by itself, prove the World Model failed to persist. The training-plan join is date- and athlete-dependent; check that a plan exists for the exact athlete/date, check the registered table and source, and separately verify the `Meterless World Model persisted assessment` log and observation visible through Zetaris.
+
+### 6. Start the Reflex dashboard
+
+Open a **third PowerShell terminal** at the repository root:
 
 ```powershell
-python cli.py --athlete athlete_001 --date 2026-10-30 --rpe 8.0
+.\.venv\Scripts\Activate.ps1
+python run.py
 ```
 
-Enter a workout description when prompted. Example inputs:
+`run.py` should launch Reflex using `python -m reflex run`. Open the local URL printed by Reflex. Keep the World Model terminal open and ensure PostgreSQL, Zetaris and Nightshift are reachable.
 
-1. `Easy cycle for 20 minutes at RPE 3`
-2. `Barbell squats 2 sets of 5 at 100 kg, RPE 8`
-3. `Single-leg hamstring curls 1 set of 12 at 18 kg, RPE 7`
-
-Type `exit` to leave the interactive CLI. The resulting status and risk flags depend on the athlete's saved history, date, the consensus extraction and the configured model. Re-running the same text can yield a different result if the underlying history or model response changes.
-
-## Logs and verification
-
-Useful runtime evidence appears in standard output, including:
-
-- `TRACE_EVENT` — agent step, action and details;
-- `AUDIT_SUMMARY` — audit verdict, number of active flags and ACWR;
-- `Meterless World Model persisted assessment` — successful persisted assessment and observation ID;
-- `Zetaris USL unified read` and `USL_UNIFIED_CONTEXT` — counts and returned plan/history/assessment context;
-- `EvaluatorAgent` / `remediation_validation` — whether a candidate alternative passed the second simulation.
-
-To run the existing World Model integration test, ensure the live database and Zetaris configuration is available, then run:
+An optional terminal entry point is available:
 
 ```powershell
-python -m pip install pytest
-python -m pytest tests\test_world_model.py -s
+python cli.py --athlete athlete_001 --date 2026-10-30 --rpe 8.5
 ```
 
-This is an integration test, not a fully offline unit test. It executes the simulation against configured data and can persist a World Model assessment.
+The CLI prompts for a workout description. Use the athlete/date/RPE that matches the data available in your environment. The exact result is state-dependent and may differ between runs.
 
-## Data and safety notes
+## Verify the end-to-end workflow
 
-- The training-plan CSV is a reference/demo fixture, not a clinical data source. Keep real personal, health or identifiable athlete data out of the public repository and demo artefacts.
-- ACWR and tissue stress values are workload heuristics, not a clinically validated injury prediction.
-- The original session remains risk-flagged when the first audit rejects it, even if an advisory alternative is generated. The candidate is not approved unless the evaluator's simulation passes.
-- Current model output formatting can vary by provider. Treat remediation as an optional advisory and review it; do not present it as medical advice.
+Check these in order:
 
-## AI, data, and third-party usage disclosure
+1. **Database connection:** the app's PostgreSQL connection uses the database where `data/schema.sql` is installed and populated. The Node service connects to `loading_agent_world_model`.
+2. **World Model server:** `Invoke-RestMethod http://127.0.0.1:8090/health` returns `ok: true`.
+3. **Dashboard:** `python run.py` opens Reflex.
+4. **Persistence:** a workload simulation produces a `Meterless World Model persisted assessment` log and an observation/run ID.
+5. **Zetaris:** the logs show `Zetaris USL unified read` and `USL_UNIFIED_CONTEXT`. Check `plan_rows` and the actual returned rows.
+6. **Audit and remediation:** inspect `AUDIT_SUMMARY`, reason codes and evaluator/remediation logs; don't treat a generated suggestion as approved unless its evaluation passes.
 
-- **Agent framework:** LangGraph orchestrates the graph; the dashboard uses Reflex and the project also provides a terminal CLI.
-- **Model provider:** Meterless Nightshift through an OpenAI-compatible adapter; the configured model and Gemini fallback are controlled by environment variables.
-- **Meterless Engine:** Meterless World Model persists workload assessments and exposes their observations to the agent through Zetaris USL.
-- **Data layer:** Zetaris serves registered application, reference-plan and World Model sources to the agent.
-- **Data:** the configured training-plan fixture is demo/reference data. Production use requires a data review and appropriate permissions.
-- **AI-assisted development:** ChatGPT was used during development/documentation. Update this section if additional AI coding tools, libraries, templates or adapted code should be disclosed.
-- **Known limitation:** an offline `SAMPLE_MODE=true` run, a clean-clone deployment, and a full Docker build have not been verified as part of the current implementation. These should be checked before submission; do not claim they work unless tested.
+Useful log markers:
 
-## Before submission
+- `TRACE_EVENT`: structured agent/workflow events.
+- `AUDIT_SUMMARY`: verdict, active flag count and reported ACWR.
+- `Meterless World Model persisted assessment`: acknowledgement from the HTTP persistence service.
+- `Zetaris USL unified read` and `USL_UNIFIED_CONTEXT`: unified query counts/results.
+- evaluator/remediation validation logs: whether the alternative passed its own simulation.
 
-- [ ] Make the GitHub repository public.
-- [ ] Confirm `.env` and real credentials are ignored and not staged; use placeholders only in `.env.example`.
-- [ ] Add at least three recorded input/output examples (the live result is data/model-dependent, so label examples accurately).
-- [ ] Keep a passing Meterless World Model test/conformance check and point to it in the final submission.
-- [ ] Demonstrate a live run with logs showing Zetaris queries, World Model persistence, and the actual model that handled a request.
-- [ ] Test from a fresh clone and verify the documented commands.
-- [ ] Implement and test a no-service `SAMPLE_MODE=true` path, if not already implemented.
-- [ ] Complete a 1–4 minute demo video, slide deck and sponsor technology explanation covering Zetaris, Meterless/Nightshift and NVIDIA/Nemotron.
-- [ ] Declare pre-existing components in the hackathon submission form.
+Re-running an audit for the same date can add another session to stored history, changing later audit context. Use a clean demo database or carefully prepared test data if you need repeatable recordings; avoid repeatedly submitting a scenario against the same live database without understanding how its history changes.
+
+## Troubleshooting
+
+| Symptom | Things to check |
+|---|---|
+| `python run.py` says Reflex is missing | Activate `.venv` and run `python -m pip install -r requirements.txt`. |
+| `npm run serve` is missing | Check `services/meterless-world-model/package.json` contains a `serve` script; commit `package.json` and `package-lock.json`. |
+| Port 8090 isn't reachable | Check the Node terminal for startup errors, `METERLESS_WM_HOST`/`METERLESS_WM_PORT`, and whether another process owns the port. |
+| Node server fails to connect to PostgreSQL | Check `WORLD_MODEL_DATABASE_URL` or the individual `WORLD_MODEL_PG*`/`POSTGRES_*` variables, database existence, schema and host-published port. The generic `DATABASE_URL` alone is not read by the inspected source. |
+| Python run fails when persistence is required | Check the World Model service is running and the root `.env` URL matches its reachable host. `METERLESS_WORLD_MODEL_REQUIRED=true` intentionally makes a failed persistence request fail the run. |
+| Zetaris REST query fails | Check `ZETARIS_REST_URL`, `ZETARIS_ORG_ID`, `ZETARIS_API_KEY`, network reachability and registered/activated USL objects. |
+| `USL_UNIFIED_CONTEXT: []` | Check athlete/date, plan rows for that date, USL table mapping and source activation. Verify persistence independently; `[]` does not automatically mean the Node write failed. |
+| Nightshift/model call fails | Check `METERLESS_BASE_URL`, `METERLESS_RUNTIME_TOKEN`, the model ID requested, and the configured provider's availability in Nightshift. NVIDIA provider keys are managed in Nightshift. |
+| Works locally but not on a second PC | Compare both `.env` files, Python/Node versions, PostgreSQL databases and data, Zetaris registrations, Nightshift provider settings and reachable URLs. These are environment-specific and are not cloned by Git. |
+| Docker networking behaves differently | Inside a container, `127.0.0.1` refers to that container. The current repository does not include a verified full Docker Compose deployment. Use reachable service names/host addresses only after configuring and testing the network. |
+
+## Demo video script (approximately 2:50)
+
+This script matches the recorded demo flow: first audit approval, adding a previous-day session, a new risk-warning state, and accepting a remediation. **The displayed ACWR remains `0.67` when the risk-warning state appears in that recording, so do not narrate that as an ACWR spike.** The change demonstrates that audit context/status changed after history was added; the specific rule/status consistency still needs further testing.
+
+### 0:00–0:20 — Problem and target user
+
+> Loading Agent helps athletes and coaches evaluate a planned workout in the context of recent training history and recovery. Instead of treating a workout in isolation, it brings together structured workload estimates, stored sessions and a World Model assessment to make the decision easier to inspect.
+
+**On screen:** dashboard overview.
+
+### 0:20–1:12 — First workload audit
+
+> First, I'm evaluating a single-leg hamstring curl for athlete 001 on 30 October: 18 kilograms for one set of 12, at an RPE of 8.5. With the history currently available, the audit approves this session and displays an ACWR of 0.67. The result reflects the workload context the system has at this point in the workflow.
+
+**On screen:** workout form and initial approved result. Keep the actual inputs/result visible.
+
+### 1:12–1:54 — Add training history
+
+> Next, I'll log a previous-day training session containing squats, hamstring curls and calf raises. That session is also approved. Now the athlete's stored history includes an additional session before the workout we're planning to assess.
+
+**On screen:** enter and save the session dated 29 October. Pause on the saved result.
+
+### 1:54–2:24 — Re-run the planned session
+
+> Now I return to the same planned hamstring curl on 30 October and run the audit again. This time, the application proposes a risk warning, and the remediation text points to possible cumulative hamstring fatigue. Notice that the displayed ACWR remains 0.67 in this run, so I'm not claiming the warning was caused by an ACWR spike. What this demonstrates is that adding prior training history can change the audit context and outcome; explaining and testing this status transition deterministically is an important next step.
+
+**On screen:** second result with `PROPOSED_RISK_WARNING` and the actual reason text. Show the ratio so the narration stays transparent.
+
+### 2:24–2:50 — Accept remediation and close
+
+> The agent can now propose a lower-load alternative. I accept the suggested active-recovery and low-load eccentric session, and the interface records `REMEDIATED_ACCEPTED`. This shows the workflow beyond initial generation: assess the original, surface a risk, and handle the proposed alternative through a separate step. Loading Agent is a prototype for workload decision support, not a clinically validated injury prediction system.
+
+**On screen:** accepted result, `REMEDIATED_ACCEPTED`, and the final alternative title.
+
+### Demo recording checklist
+
+- Show the real inputs, outcomes and transition; do not fabricate or replace output values.
+- If you record a new run and its ACWR/flags differ, update the narration to match the new result.
+- Show the real `Meterless World Model persisted assessment` event and a non-empty `USL_UNIFIED_CONTEXT` if available. If the unified context is empty, don't present it as a successful join; explain the missing plan/history match or leave it out of the video.
+- Verify and show the resolved model in Nightshift if claiming that a particular request used NVIDIA Nemotron. A configured model ID alone is not proof of which model handled a particular call.
+- Redact credentials, tokens, private URLs and personal data from screen captures.
+- Keep the final video between 1 and 4 minutes.
+
+## Limitations and next steps
+
+- The current audit rules and stress/ACWR values are prototype heuristics, not validated clinical thresholds.
+- Outcome consistency depends on history, date and model-generated extraction/remediation; deterministic regression tests are still needed around baseline handling, warning versus approval status, repeat runs and malformed alternatives.
+- The unified context can be empty when the date-/athlete-specific plan join finds no row even if assessment persistence succeeded.
+- A fully reproducible clean-clone setup requires database schema/data and Zetaris/Nightshift environment configuration. The current setup guide does not claim an offline `SAMPLE_MODE` or full Docker Compose deployment has been verified.
+- Future work: deterministic audit tests; clearer provenance from each flag to input and source row; explicit resolved-model logging; deployment automation for app + World Model + PostgreSQL; and a tested sample/offline path.
+
+## Sponsor technology
+
+- **Zetaris:** the app's query layer for registered app data, the training-plan reference and persisted World Model tables. The `USL_UNIFIED_CONTEXT` read combines plan/history/assessment context when matching source rows are available.
+- **Meterless Nightshift:** the OpenAI-compatible endpoint used by the app's model adapter for consensus/remediation-related model calls.
+- **Meterless World Model:** the separate TypeScript HTTP service calls the Meterless World Model implementation to upsert athlete/session entities and persist provenance-stamped assessment observations in PostgreSQL.
+- **NVIDIA Nemotron:** the app requests the configured model through Nightshift (current example: `nvidia/nemotron-3.5-lightning-30b-a3b`). The actual resolved model must be evidenced in Nightshift/run logs for any specific demo request.
+- **Cursor / development tooling:** disclose the tools actually used in the build according to the hackathon form's instructions.
+
+## Before publishing
+
+- [ ] Confirm the repository is public and the README matches the actual committed paths.
+- [ ] Commit `services/meterless-world-model/server.ts`, `index.ts`, `package.json`, `package-lock.json`, schema and `.env.example`.
+- [ ] Commit the root `.env.example`; do not commit either real `.env`.
+- [ ] Check `.gitignore` excludes `**/node_modules/`, `.venv/`, real env files, local databases and volume directories.
+- [ ] Run `git status --short` and `git diff --check`; inspect staged files for credentials and local data.
+- [ ] Verify the service starts with `npm ci` + `npm run serve` on a clean clone.
+- [ ] Verify the app starts with `python -m pip install -r requirements.txt` + `python run.py`.
+- [ ] Perform one end-to-end run and capture the actual persistence and Zetaris query logs.
+- [ ] Ensure the demo script and track name agree with the actual final video and submission form.

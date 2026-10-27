@@ -1,20 +1,31 @@
+# Python bytecode
 *.py[cod]
+__pycache__/
+
+# Reflex / application state
 .states
 .web
 assets/external/
-# Environment & Local Secrets
+
+# Environment & local secrets
 .env
 *.env
 
-# Local Database Volume Mounts / SQLite Files
+# Local database files and volume mounts
 *.db
 *.sqlite3
 pgdata/
 zetaris_data/
 
-# Python Runtime Artifacts
-__pycache__/
-*.pyc
+# Python runtime artifacts
 .pytest_cache/
 .venv/
 env/
+
+# Node.js dependencies (including the Meterless World Model service)
+**/node_modules/
+
+# Node.js logs
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*

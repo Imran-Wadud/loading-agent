@@ -1,0 +1,12 @@
+{
+  "dependencies": {
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.23.15"
+  },
+  "scripts": {
+    "serve": "node --env-file=.env --import tsx server.ts"
+  }
+}

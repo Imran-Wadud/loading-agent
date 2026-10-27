@@ -28,32 +28,54 @@ class WorldModelEngine:
         else:
             return "DISTANT_PAST"
 
-    def audit_downstream_timeline(self, athlete_id: str, from_date: date) -> List[Dict[str, Any]]:
-        """
-        Scans all sessions on or after `from_date` stored in PostgreSQL.
-        Re-evaluates each downstream session against updated tissue loads using simulate_state_delta.
-        """
-        sessions = self.db_adapter.load_sessions(athlete_id)
-        flagged_sessions = []
+    def audit_downstream_timeline(
+        self, athlete_id: str, from_date: date
+    ) -> List[Dict[str, Any]]:
+        logger.info(
+            "[Cascade] Starting downstream audit: athlete=%s from_date=%s",
+            athlete_id, from_date
+        )
 
-        # Filter downstream sessions chronologically
+        sessions = self.db_adapter.load_sessions(athlete_id)
+        logger.info(
+            "[Cascade] Loaded %d total sessions for athlete=%s",
+            len(sessions), athlete_id
+        )
+
         downstream = []
         for s in sessions:
             s_date = s["session_date"]
             if isinstance(s_date, str):
                 s_date = date.fromisoformat(s_date)
+
             if s_date > from_date:
                 downstream.append((s_date, s))
-        
+
         downstream.sort(key=lambda x: x[0])
 
+        logger.info(
+            "[Cascade] Found %d downstream sessions after %s",
+            len(downstream), from_date
+        )
+
+        flagged_sessions = []
+
         for s_date, s in downstream:
-            # Fetch extracted tissue loads already stored in DB for this session
-            tissue_loads = self.db_adapter.get_session_tissue_loads(s["session_id"])
+            session_id = s["session_id"]
+            logger.info(
+                "[Cascade] Re-auditing session=%s date=%s title=%s",
+                session_id, s_date, s.get("session_title")
+            )
+
+            tissue_loads = self.db_adapter.get_session_tissue_loads(session_id)
+
             if not tissue_loads:
+                logger.warning(
+                    "[Cascade] Skipping session=%s: no stored tissue loads",
+                    session_id
+                )
                 continue
 
-            # Run full state delta simulation preserving all temporal tiers & RPE rules
             sim_res = self.simulate_state_delta(
                 athlete_id=athlete_id,
                 session_date=s_date,
@@ -61,14 +83,36 @@ class WorldModelEngine:
                 session_rpe=float(s.get("session_rpe") or 8.0),
             )
 
-            if not sim_res["simulation_approved"]:
+            violations = sim_res.get("violations", [])
+            logger.info(
+                "[Cascade] Result session=%s approved=%s violations=%d ACWR=%s",
+                session_id,
+                sim_res.get("simulation_approved"),
+                len(violations),
+                sim_res.get("acwr"),
+            )
+
+            # Flag violations independently of the critical-only approval result.
+            if violations:
                 flagged_sessions.append({
-                    "session_id": s["session_id"],
+                    "session_id": session_id,
                     "session_date": s_date,
                     "session_title": s.get("session_title"),
                     "raw_input": s.get("raw_input"),
                     "sim_result": sim_res,
                 })
+                logger.info(
+                    "[Cascade] Flagged session=%s date=%s violations=%d approved=%s",
+                    s["session_id"],
+                    s_date,
+                    len(violations),
+                    sim_res["simulation_approved"],
+                )
+
+        logger.info(
+            "[Cascade] Audit complete: checked=%d flagged=%d",
+            len(downstream), len(flagged_sessions)
+        )
 
         return flagged_sessions
 
@@ -128,36 +172,70 @@ class WorldModelEngine:
             required_window_hours = round(base_window_hours * rpe_factor, 1)
             
             for prev in historical_loads:
-                if prev["body_part_id"] == body_part_id:
-                    prev_date = prev["session_date"]
-                    if isinstance(prev_date, str):
-                        prev_date = date.fromisoformat(prev_date)
-                        
-                    delta_days = (session_date - prev_date).days
-                    if delta_days <= 0:
-                        continue
+                if prev["body_part_id"] != body_part_id:
+                    continue
 
-                    delta_hours = max(0.0, delta_days * 24.0)
+                prev_date = prev["session_date"]
+                if isinstance(prev_date, str):
+                    prev_date = date.fromisoformat(prev_date)
+
+                delta_days = (session_date - prev_date).days
+                if delta_days <= 0:
+                    continue
+
+                delta_hours = delta_days * 24.0
+
+                try:
+                    previous_stress = float(prev["stress_score"])
+                    current_stress = float(stress_score)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "[World Model] Skipping recovery comparison: "
+                        "invalid stress score for tissue=%s, previous=%r, current=%r",
+                        body_part_id,
+                        prev.get("stress_score"),
+                        stress_score,
+                    )
+                    continue
+
+                logger.info(
+                    "[World Model Debug] Tissue=%s (%s), "
+                    "previous_date=%s, current_date=%s, "
+                    "previous_stress=%.2f, current_stress=%.2f, "
+                    "gap_hours=%.1f, required_hours=%.1f",
+                    body_part_name,
+                    body_part_id,
+                    prev_date,
+                    session_date,
+                    previous_stress,
+                    current_stress,
+                    delta_hours,
+                    required_window_hours,
+                )
+
+                if (
+                    delta_hours < required_window_hours
+                    and previous_stress >= 5.0
+                    and current_stress >= 5.0
+                ):
+                    severity = "CRITICAL" if temporal_tier == "FUTURE_OR_TODAY" else "WARNING"
+                    msg_prefix = "PROACTIVE CONFLICT" if temporal_tier == "FUTURE_OR_TODAY" else "REACTIVE OVERUSE DETECTED"
                     
-                    if delta_hours < required_window_hours and prev["stress_score"] >= 5.0 and stress_score >= 5.0:
-                        severity = "CRITICAL" if temporal_tier == "FUTURE_OR_TODAY" else "WARNING"
-                        msg_prefix = "PROACTIVE CONFLICT" if temporal_tier == "FUTURE_OR_TODAY" else "REACTIVE OVERUSE DETECTED"
-                        
-                        violations.append({
-                            "type": "TISSUE_RECOVERY_VIOLATION",
-                            "severity": severity,
-                            "temporal_tier": temporal_tier,
-                            "entity": body_part_name,
-                            "tissue_type": tissue_type,
-                            "proposed_stress": stress_score,
-                            "prior_session_date": str(prev_date),
-                            "hours_since_last_load": delta_hours,
-                            "required_recovery_hours": required_window_hours,
-                            "message": (
-                                f"{msg_prefix}: High {tissue_type} strain on '{body_part_name}' (Score {stress_score:.1f}) "
-                                f"within {delta_hours:.0f}h of prior load on {prev_date}. Requires {required_window_hours}h recovery."
-                            )
-                        })
+                    violations.append({
+                        "type": "TISSUE_RECOVERY_VIOLATION",
+                        "severity": severity,
+                        "temporal_tier": temporal_tier,
+                        "entity": body_part_name,
+                        "tissue_type": tissue_type,
+                        "proposed_stress": stress_score,
+                        "prior_session_date": str(prev_date),
+                        "hours_since_last_load": delta_hours,
+                        "required_recovery_hours": required_window_hours,
+                        "message": (
+                            f"{msg_prefix}: High {tissue_type} strain on '{body_part_name}' (Score {stress_score:.1f}) "
+                            f"within {delta_hours:.0f}h of prior load on {prev_date}. Requires {required_window_hours}h recovery."
+                        )
+                    })
 
         # Calculate ACWR for past 28 days
         history_map = self.db_adapter.fetch_historical_daily_loads(athlete_id, session_date, days=28)

@@ -368,28 +368,43 @@ class ZetarisDBAdapter:
     def get_cached_tissue_loads(self, raw_input: str) -> Optional[Dict[str, Any]]:
         if not raw_input or not raw_input.strip():
             return None
+
         try:
             rows = _execute_usl_query(
                 f"""
-                SELECT s.session_title, bp.body_part_id, bp.name,
-                       bp.tissue_type, tl.stress_score
-                FROM {USL_PREFIX}.athlete_sessions s
+                WITH latest_session AS (
+                    SELECT session_id, session_title, session_date
+                    FROM {USL_PREFIX}.athlete_sessions
+                    WHERE raw_input = %s
+                    ORDER BY session_date DESC
+                    LIMIT 1
+                )
+                SELECT
+                    s.session_title,
+                    bp.body_part_id,
+                    bp.name,
+                    bp.tissue_type,
+                    tl.stress_score
+                FROM latest_session s
                 JOIN {USL_PREFIX}.tissue_loads_logged tl
-                  ON s.session_id = tl.session_id
+                ON s.session_id = tl.session_id
                 JOIN {USL_PREFIX}.body_parts bp
-                  ON tl.body_part_id = bp.body_part_id
-                WHERE s.raw_input = %s
-                ORDER BY s.session_date DESC
-                LIMIT 1
+                ON tl.body_part_id = bp.body_part_id
+                ORDER BY bp.body_part_id
                 """,
                 (raw_input.strip(),),
                 columns=[
-                    "session_title", "body_part_id", "name",
-                    "tissue_type", "stress_score",
+                    "session_title",
+                    "body_part_id",
+                    "name",
+                    "tissue_type",
+                    "stress_score",
                 ],
             )
+
             if not rows:
                 return None
+
             return {
                 "session_title": rows[0]["session_title"],
                 "loads": [
@@ -402,6 +417,7 @@ class ZetarisDBAdapter:
                     for row in rows
                 ],
             }
+
         except Exception:
             logger.exception("Zetaris cache lookup failed")
             return None
@@ -492,55 +508,72 @@ class ZetarisDBAdapter:
         session_id: str,
         new_title: str,
         remediated_text: str,
-        new_loads: Optional[List[Dict[str, Any]]] = None,
+        new_loads: List[Dict[str, Any]],
         new_status: str = "REMEDIATED_ACCEPTED",
     ) -> bool:
         try:
-            if new_loads is not None:
-                for item in new_loads:
-                    if "body_part_id" not in item or "stress_score" not in item:
-                        raise ValueError(
-                            "Each new load must include body_part_id and stress_score"
-                        )
+            # Validate everything before modifying the database.
+            for item in new_loads:
+                if "body_part_id" not in item or "stress_score" not in item:
+                    raise ValueError(
+                        "Each new load must include body_part_id and stress_score"
+                    )
 
             with _postgres_transaction() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
                         """
                         UPDATE public.athlete_sessions
-                        SET session_title = %s, raw_input = %s, status = %s,
+                        SET session_title = %s,
+                            raw_input = %s,
+                            status = %s,
                             remediation_suggestion = NULL
                         WHERE session_id = %s
                         """,
                         (new_title, remediated_text, new_status, session_id),
                     )
+
                     if cursor.rowcount == 0:
-                        logger.warning("Cannot remediate missing session %s", session_id)
+                        logger.warning(
+                            "Cannot remediate missing session %s", session_id
+                        )
                         return False
 
-                    # None preserves existing loads; [] clears them.
-                    if new_loads is not None:
+                    # Replace, rather than append to, the original tissue loads.
+                    cursor.execute(
+                        """
+                        DELETE FROM public.tissue_loads_logged
+                        WHERE session_id = %s
+                        """,
+                        (session_id,),
+                    )
+
+                    for item in new_loads:
                         cursor.execute(
-                            "DELETE FROM public.tissue_loads_logged WHERE session_id = %s",
-                            (session_id,),
-                        )
-                        for item in new_loads:
-                            cursor.execute(
-                                """
-                                INSERT INTO public.tissue_loads_logged (
-                                    session_id, body_part_id, stress_score, volume_mins
-                                )
-                                VALUES (%s, %s, %s, %s)
-                                """,
-                                (
-                                    session_id, item["body_part_id"],
-                                    item["stress_score"], item.get("volume_mins", 0),
-                                ),
+                            """
+                            INSERT INTO public.tissue_loads_logged (
+                                session_id, body_part_id, stress_score, volume_mins
                             )
-            logger.info("Applied remediation for session %s via PostgreSQL.", session_id)
+                            VALUES (%s, %s, %s, %s)
+                            """,
+                            (
+                                session_id,
+                                item["body_part_id"],
+                                item["stress_score"],
+                                item.get("volume_mins", 0),
+                            ),
+                        )
+
+            logger.info(
+                "Applied remediation and replaced tissue loads for session %s.",
+                session_id,
+            )
             return True
+
         except Exception:
-            logger.exception("Error applying remediation swap for session %s", session_id)
+            logger.exception(
+                "Error applying remediation swap for session %s", session_id
+            )
             return False
 
     def save_approved_session(

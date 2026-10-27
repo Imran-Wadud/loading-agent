@@ -1,5 +1,7 @@
 # app/ui/state.py
 import asyncio
+import logging
+
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Any, Optional
 from pydantic import BaseModel
@@ -7,7 +9,9 @@ import reflex as rx
 
 from app.graph import workload_graph
 from app.adapters.zetaris import ZetarisDBAdapter
+from app.engines.consensus import run_meterless_consensus
 
+logger = logging.getLogger(__name__)
 
 class CalendarDay(BaseModel):
     date_str: str
@@ -213,41 +217,74 @@ class AppState(rx.State):
             self.status_message = f"DB Load Warning: {str(e)}"
 
     def accept_remediation_plan(self, session_id: str):
-        """Swaps a flagged workout with its suggested alternative routine."""
+        """Accept remediation, recalculate loads, and replace the stored workout."""
         db = ZetarisDBAdapter()
-        
-        target_day = None
-        for day in self.calendar_data.values():
-            if day.session_id and str(day.session_id) == str(session_id):
-                target_day = day
-                break
+
+        target_day = next(
+            (
+                day for day in self.calendar_data.values()
+                if day.session_id and str(day.session_id) == str(session_id)
+            ),
+            None,
+        )
 
         if not target_day and self.selected_date_str in self.calendar_data:
             target_day = self.calendar_data[self.selected_date_str]
 
         if not target_day:
+            self.status_message = "Could not find the workout to remediate."
             return
 
         s_id = target_day.session_id or session_id
-        remediation_text = target_day.remediation_suggestion or ""
-        clean_title = (
-            (target_day.session_title or "Workout")
-            .replace("[RISK]", "")
-            .replace("[ADVISORY WARNING]", "")
-            .replace("[HIGH STRAIN]", "")
-            .strip()
-        )
-        new_title = f"[ADOPTED] {clean_title}"
+        remediation_text = (target_day.remediation_suggestion or "").strip()
+
+        if not remediation_text:
+            self.status_message = "No remediation suggestion is available."
+            return
+
+        self.status_message = "Recalculating tissue loads for accepted workout..."
+
+        try:
+            target_date = date.fromisoformat(target_day.date_str)
+
+            result = run_meterless_consensus(
+                athlete_id=self.athlete_id,
+                session_date=target_date,
+                raw_text=remediation_text,
+                session_rpe=self.session_rpe_input,
+            )
+
+            new_loads = result["consensus_loads"]
+            new_title = f"[ADOPTED] {result['session_title']}"
+
+        except Exception:
+            logger.exception(
+                "Failed to calculate replacement loads for session %s", s_id
+            )
+            self.status_message = (
+                "Could not calculate tissue loads. The existing workout was unchanged."
+            )
+            return
 
         success = db.swap_remediated_workout(
             session_id=s_id,
             new_title=new_title,
-            remediated_text=f"Accepted Remediation Plan:\n{remediation_text}",
-            new_status="REMEDIATED_ACCEPTED"
+            remediated_text=remediation_text,
+            new_loads=new_loads,
+            new_status="REMEDIATED_ACCEPTED",
         )
 
         if success:
             self.load_existing_sessions()
+            self.status_message = (
+                f"Remediation accepted; replaced tissue loads with "
+                f"{len(new_loads)} recalculated loads."
+            )
+        else:
+            self.status_message = (
+                "Could not save the remediation. The existing workout was unchanged."
+            )
+
     
     async def submit_workout_pipeline(self):
         """Delegates evaluation & downstream cascade strictly to LangGraph agent and refreshes UI state."""

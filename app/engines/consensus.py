@@ -51,20 +51,52 @@ def extract_single_pass(
         ])
 
         raw_content = response.content.strip()
-        
-        # Robust Regex Extraction (handles raw JSON, ```json blocks, and text preambles)
+
         json_match = re.search(r"\{.*\}", raw_content, re.DOTALL)
         if not json_match:
-            logger.error(f"[Pass {pass_num}] Failed to parse valid JSON from LLM output: {raw_content[:100]}")
-            return {"session_title": "Extraction Failed", "loads": []}
+            logger.error(
+                "[Pass %s] Failed to parse JSON: %s",
+                pass_num, raw_content[:200],
+            )
+            return {
+                "ok": False,
+                "session_title": "Extraction Failed",
+                "loads": [],
+            }
 
         parsed = json.loads(json_match.group(0))
-        loads = parsed.get("loads", [])
-        logger.info(f"[Pass {pass_num}] Successfully extracted {len(loads)} raw tissue items.")
-        return parsed
+
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("loads"), list):
+            logger.error("[Pass %s] Invalid extraction structure", pass_num)
+            return {
+                "ok": False,
+                "session_title": "Extraction Failed",
+                "loads": [],
+            }
+
+        logger.info(
+            "[Pass %s] Successfully parsed response containing %s tissue items.",
+            pass_num, len(parsed["loads"]),
+        )
+
+        return {
+            "ok": True,
+            "session_title": parsed.get("session_title", "Logged Session"),
+            "loads": parsed["loads"],
+        }
+    
     except Exception as e:
-        logger.error(f"[Pass {pass_num}] LLM Invoke Exception: {e}", exc_info=True)
-        return {"session_title": "Exception", "loads": []}
+        logger.error(
+            "[Pass %s] LLM Invoke Exception: %s",
+            pass_num,
+            e,
+            exc_info=True,
+        )
+        return {
+            "ok": False,
+            "session_title": "Extraction Failed",
+            "loads": [],
+        }
 
 
 def run_meterless_consensus(
@@ -91,11 +123,56 @@ def run_meterless_consensus(
             except Exception as e:
                 logger.error(f"Extraction pass encountered an error: {e}")
 
-    successful_passes = [r for r in results if r.get("loads")]
-    logger.info(f"Completed {len(successful_passes)} / {num_passes} successful LLM passes.")
+    successful_passes = [r for r in results if r.get("ok")]
+
+    logger.info(
+        "Completed %s / %s successful LLM passes.",
+        len(successful_passes), num_passes,
+    )
 
     if not successful_passes:
         raise ValueError("All consensus extraction passes failed!")
+
+    session_titles = [
+        r.get("session_title", "Logged Session")
+        for r in successful_passes
+    ]
+    consensus_session_title = max(
+        set(session_titles), key=session_titles.count
+    )
+
+    # A rest session is valid only when the model explicitly identifies
+    # the activity as rest/recovery. Don't interpret arbitrary empty
+    # outputs as a rest day.
+    is_rest_session = bool(re.search(
+        r"\b(rest|rest day|recovery day|complete rest)\b",
+        raw_text,
+        re.IGNORECASE,
+    ))
+
+    if is_rest_session:
+        if any(r["loads"] for r in successful_passes):
+            logger.warning(
+                "Rest-like input produced tissue loads; retaining normal "
+                "consensus validation."
+            )
+        else:
+            return {
+                "athlete_id": athlete_id,
+                "session_date": session_date,
+                "session_title": consensus_session_title,
+                "consensus_loads": [],
+                "raw_text": raw_text,
+                "session_rpe": session_rpe,
+            }
+
+    # Continue with your existing body_part_votes aggregation below.
+    successful_passes = [r for r in successful_passes if r["loads"]]
+
+    if not successful_passes:
+        raise ValueError(
+            "No tissue loads extracted from a non-rest workout."
+        )
 
     session_titles = [r.get("session_title", "Logged Session") for r in successful_passes]
     consensus_session_title = max(set(session_titles), key=session_titles.count)

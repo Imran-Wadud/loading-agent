@@ -350,11 +350,37 @@ def cascade_audit_node(state: WorkloadState) -> Dict[str, Any]:
             logger.error(f"[Cascade Audit Node] Error saving unapproved session: {e}")
 
     # Re-audit downstream timeline
+    logger.info(
+        "[Cascade] Starting timeline audit: athlete=%s, from_date=%s",
+        athlete_id,
+        session_date,
+    )
+
     flagged_sessions = []
+
     try:
-        flagged_sessions = world_model.audit_downstream_timeline(athlete_id, session_date)
-    except Exception as e:
-        logger.error(f"[Cascade Audit Node] Error auditing downstream timeline: {e}")
+        flagged_sessions = world_model.audit_downstream_timeline(
+            athlete_id, session_date
+        )
+
+        logger.info(
+            "[Cascade] Timeline audit completed: %d flagged downstream sessions",
+            len(flagged_sessions),
+        )
+
+    except Exception:
+        logger.exception("[Cascade] Downstream timeline audit failed")
+
+    if not flagged_sessions:
+        logger.info(
+            "[Cascade] No downstream sessions require flagging for athlete=%s",
+            athlete_id,
+        )
+    else:
+        logger.info(
+            "[Cascade] Processing %d flagged downstream sessions",
+            len(flagged_sessions),
+        )
 
     if flagged_sessions:
         llm = get_meterless_llm()
@@ -363,7 +389,23 @@ def cascade_audit_node(state: WorkloadState) -> Dict[str, Any]:
             s_date = item["session_date"]
             sim_res = item["sim_result"]
             flags = [v.get("message", str(v)) for v in sim_res.get("violations", [])]
+            logger.info(
+                "[Cascade] Flagged session: id=%s date=%s title=%s violations=%d",
+                s_id,
+                s_date,
+                item.get("session_title"),
+                len(flags),
+            )
             
+            if s_date < today:
+                logger.info(
+                    "[Cascade] Session %s is historical; recording the flag "
+                    "without generating a remediation plan",
+                    s_id,
+                )
+                # Historical sessions should be flagged, not remediated.
+                continue
+
             system_prompt = (
                 "You are a Strength & Conditioning Biomechanics Advisor.\n"
                 "A backfilled prior workout has updated cumulative fatigue, creating potential tissue strain for this session.\n"
@@ -391,8 +433,15 @@ def cascade_audit_node(state: WorkloadState) -> Dict[str, Any]:
                     status="PROPOSED_RISK_WARNING",
                     remediation_suggestion=response.content
                 )
-            except Exception as e:
-                logger.error(f"[Cascade Audit Node] Downstream remediation error for session {s_id}: {e}")
+                logger.info(
+                    "[Cascade] Updated future/today session %s to PROPOSED_RISK_WARNING",
+                    s_id,
+                )
+            except Exception:
+                logger.exception(
+                    "[Cascade] Downstream remediation failed for session %s",
+                    s_id,
+                )
 
     return {
         "session_id": current_session_id or state.get("session_id"),

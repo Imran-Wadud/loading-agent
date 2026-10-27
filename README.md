@@ -83,21 +83,21 @@ The TypeScript service is **a separate process**. It persists assessment observa
 
 ### Key components
 
-| Path | Role |
-|---|---|
-| `run.py` | Launches the Reflex app using the project's Reflex configuration. |
-| `rxconfig.py`, `app/app.py` | Reflex configuration and app entry point. |
-| `app/graph.py` | LangGraph state, orchestration, audit flow, remediation/evaluator loop and commit/cascade operations. |
-| `app/engines/consensus.py` | Multi-pass workout-to-tissue-load extraction. |
-| `app/engines/world_model.py` | Workload calculation, ACWR, tissue recovery and risk flags. |
-| `app/adapters/meterless.py` | OpenAI-compatible client for Meterless Nightshift and the configured model/provider preference. |
-| `app/adapters/meterless_world_model.py` | HTTP client for persisting a completed assessment to the separate TypeScript service. |
-| `app/adapters/zetaris.py` | PostgreSQL access for app-owned records and read queries through Zetaris REST SQL/USL. |
-| `services/meterless-world-model/server.ts` | HTTP server exposing `/health` and `POST /assessments`. |
-| `services/meterless-world-model/index.ts` | Meterless World Model implementation used by the service. |
-| `services/meterless-world-model/schema_postgres.sql` | PostgreSQL schema for World Model persistence (if this is the path in your current checkout). |
-| `data/schema.sql` | Application tables and initial schema. **This schema contains `DROP TABLE IF EXISTS` statements: use it only when setting up a fresh/empty app database.** |
-| `scripts/seed_db.py` | Applies `data/schema.sql` and seeds the default athlete/body-part dictionary. This also runs the destructive schema statements; do not run it against a database containing data you need to keep. |
+| Path                                                 | Role                                                                                                                                                                                               |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `run.py`                                             | Launches the Reflex app using the project's Reflex configuration.                                                                                                                                  |
+| `rxconfig.py`, `app/app.py`                          | Reflex configuration and app entry point.                                                                                                                                                          |
+| `app/graph.py`                                       | LangGraph state, orchestration, audit flow, remediation/evaluator loop and commit/cascade operations.                                                                                              |
+| `app/engines/consensus.py`                           | Multi-pass workout-to-tissue-load extraction.                                                                                                                                                      |
+| `app/engines/world_model.py`                         | Workload calculation, ACWR, tissue recovery and risk flags.                                                                                                                                        |
+| `app/adapters/meterless.py`                          | OpenAI-compatible client for Meterless Nightshift and the configured model/provider preference.                                                                                                    |
+| `app/adapters/meterless_world_model.py`              | HTTP client for persisting a completed assessment to the separate TypeScript service.                                                                                                              |
+| `app/adapters/zetaris.py`                            | PostgreSQL access for app-owned records and read queries through Zetaris REST SQL/USL.                                                                                                             |
+| `services/meterless-world-model/server.ts`           | HTTP server exposing `/health` and `POST /assessments`.                                                                                                                                            |
+| `services/meterless-world-model/index.ts`            | Meterless World Model implementation used by the service.                                                                                                                                          |
+| `services/meterless-world-model/schema_postgres.sql` | PostgreSQL schema for World Model persistence (if this is the path in your current checkout).                                                                                                      |
+| `data/schema.sql`                                    | Application tables and initial schema. **This schema contains** `DROP TABLE IF EXISTS` **statements: use it only when setting up a fresh/empty app database.**                                     |
+| `scripts/seed_db.py`                                 | Applies `data/schema.sql` and seeds the default athlete/body-part dictionary. This also runs the destructive schema statements; do not run it against a database containing data you need to keep. |
 
 ## Repository layout
 
@@ -222,7 +222,7 @@ cd services\meterless-world-model
 Copy-Item .env.example .env
 ```
 
-Configure the service `.env` to connect to its **own** PostgreSQL database, `loading_agent_world_model` in the example setup. The inspected `index.ts` reads `WORLD_MODEL_DATABASE_URL`, or the `WORLD_MODEL_PG*` / `POSTGRES_*` host, port, user, password and database variables. It does **not** read a generic `DATABASE_URL` by itself.
+Configure the service `.env` to connect to its **own** PostgreSQL database, `loading_agent_world_model` in the example setup. The inspected `index.ts` reads `WORLD_MODEL_DATABASE_URL`, or the `WORLD_MODEL_PG`* / `POSTGRES_*` host, port, user, password and database variables. It does **not** read a generic `DATABASE_URL` by itself.
 
 Recommended connection-string form:
 
@@ -365,7 +365,7 @@ Re-running an audit for the same date can add another session to stored history,
 
 ## Demo video script (approximately 2:50)
 
-This script matches the recorded demo flow: first audit approval, adding a previous-day session, a new risk-warning state, and accepting a remediation. **The displayed ACWR remains `0.67` when the risk-warning state appears in that recording, so do not narrate that as an ACWR spike.** The change demonstrates that audit context/status changed after history was added; the specific rule/status consistency still needs further testing.
+This script matches the recorded demo flow: first audit approval, adding a previous-day session, a new risk-warning state, and accepting a remediation. **The displayed ACWR remains** `0.67` **when the risk-warning state appears in that recording, so do not narrate that as an ACWR spike.** The change demonstrates that audit context/status changed after history was added; the specific rule/status consistency still needs further testing.
 
 ### 0:00–0:20 — Problem and target user
 

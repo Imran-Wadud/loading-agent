@@ -1,7 +1,7 @@
 # clean.py
-from app.adapters.zetaris import get_db_connection
+from app.adapters.zetaris import _get_db_connection
 
-conn = get_db_connection()
+conn = _get_db_connection()
 try:
     with conn.cursor() as cur:
         # Delete tissue loads linked to athlete_001 first to prevent Foreign Key conflicts

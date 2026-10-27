@@ -8,7 +8,7 @@ from langgraph.graph import StateGraph, END
 
 # Adapters & Engines
 from app.adapters.meterless import get_meterless_llm
-from app.adapters.zetaris import ZetarisDBAdapter, get_db_connection
+from app.adapters.zetaris import ZetarisDBAdapter
 from app.engines.consensus import run_meterless_consensus
 from app.engines.world_model import WorldModelEngine
 

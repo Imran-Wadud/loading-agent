@@ -6,7 +6,7 @@ from pydantic import BaseModel
 import reflex as rx
 
 from app.graph import workload_graph
-from app.adapters.zetaris import get_db_connection, ZetarisDBAdapter
+from app.adapters.zetaris import ZetarisDBAdapter
 
 
 class CalendarDay(BaseModel):
